@@ -7,6 +7,21 @@ Changes:
  - obspy.core:
    * util: removed old and outdated 'CatchWarnings' context manager in favor of
      the better 'CatchAndAssertWarnings' context manager (see #3452)
+   * inventory: add `Inventory.get_channel_epoch()`, a strict lookup of the
+     unique channel epoch carrying response information for a full SEED
+     channel ID and a point in time, raising dedicated exceptions
+     (`NoMatchingChannelEpochError`, `MultipleMatchingChannelEpochsError`)
+     when there is no or more than one match
+ - obspy.signal:
+   * PPSD: add optional spectra archiving (`archive_spectra=True` together
+     with a `metadata_version` label) which stores for every processed time
+     window the raw (not instrument corrected) one-sided spectrum as float64
+     plus a calibration record (metadata version, channel ID, actual response
+     lookup time, channel epoch start/end). Archived windows can later be
+     recalibrated with corrected metadata (e.g. a corrected StationXML file)
+     using `PPSD.recalibrate()`, without the raw waveform data. The archive
+     is stored in additional arrays in the regular npz files, which stay
+     readable as plain PPSD results
  - obspy.clients.fdsn
    * make sure to use a copy of `DEFAULT_SERVICES` when initializing a client
      instance while skipping service discovery, to avoid accidental changes to

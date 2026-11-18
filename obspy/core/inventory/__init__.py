@@ -216,7 +216,9 @@ from .util import (Angle, Azimuth, BaseNode, ClockDrift, Comment, Dip,
                    Longitude, Operator, Person, PhoneNumber, SampleRate, Site)
 
 from .channel import Channel
-from .inventory import Inventory, read_inventory
+from .inventory import (ChannelEpochLookupError, Inventory,
+                        MultipleMatchingChannelEpochsError,
+                        NoMatchingChannelEpochError, read_inventory)
 from .network import Network
 from .response import (CoefficientsTypeResponseStage,
                        CoefficientWithUncertainties, FilterCoefficient,

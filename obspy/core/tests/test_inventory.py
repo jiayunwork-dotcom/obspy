@@ -25,6 +25,9 @@ from obspy.core.util.base import _get_entry_points
 from obspy.core.util.base import CatchAndAssertWarnings
 from obspy.core.inventory import (Channel, Inventory, Network, Response,
                                   Station)
+from obspy.core.inventory import (ChannelEpochLookupError,
+                                  MultipleMatchingChannelEpochsError,
+                                  NoMatchingChannelEpochError)
 from obspy.core.inventory.util import _unified_content_strings
 
 
@@ -104,6 +107,70 @@ class TestInventory:
         response = inv.get_response('N2.N2S1..BHZ',
                                     UTCDateTime('2010-01-01T12:00'))
         assert response == response_n2_s1
+
+    def test_get_channel_epoch(self):
+        """
+        Test the strict channel epoch lookup.
+        """
+        response_1 = Response('RESP1')
+        response_2 = Response('RESP2')
+        t1 = UTCDateTime('2010-01-01T00:00')
+        t2 = UTCDateTime('2011-01-01T00:00')
+        t3 = UTCDateTime('2012-01-01T00:00')
+        # one open-ended epoch and one closed epoch for the same channel
+        channels = [
+            Channel(code='BHZ', location_code='', latitude=0.0,
+                    longitude=0.0, elevation=0.0, depth=0.0,
+                    response=response_1, start_date=t1, end_date=t2),
+            Channel(code='BHZ', location_code='10', latitude=0.0,
+                    longitude=0.0, elevation=0.0, depth=0.0,
+                    response=response_2, start_date=t2, end_date=None),
+            # channel without response information must never match
+            Channel(code='BHN', location_code='', latitude=0.0,
+                    longitude=0.0, elevation=0.0, depth=0.0,
+                    response=None, start_date=t1, end_date=t3)]
+        stations = [Station(code='XYZ', latitude=0.0, longitude=0.0,
+                            elevation=0.0, channels=channels)]
+        inv = Inventory(networks=[Network('N1', stations=stations)],
+                        source='TEST')
+
+        # unique match, also checks that the same channel code at another
+        # location does not interfere
+        channel = inv.get_channel_epoch('N1.XYZ..BHZ', t1)
+        assert channel.response is response_1
+        assert channel.start_date == t1
+        assert channel.end_date == t2
+        # endpoints are inclusive, like in the regular response lookup
+        assert inv.get_channel_epoch('N1.XYZ..BHZ', t2).response is \
+            response_1
+        # open start/end dates mean the epoch is open towards past/future
+        assert inv.get_channel_epoch('N1.XYZ.10.BHZ', t3).response is \
+            response_2
+        # no match: wrong time, unknown channel, channel without response
+        with pytest.raises(NoMatchingChannelEpochError):
+            inv.get_channel_epoch('N1.XYZ..BHZ', t3)
+        with pytest.raises(NoMatchingChannelEpochError):
+            inv.get_channel_epoch('N1.XYZ..BHE', t1)
+        with pytest.raises(NoMatchingChannelEpochError):
+            inv.get_channel_epoch('N1.XYZ..BHN', t1)
+        # both lookup errors subclass a common base class
+        with pytest.raises(ChannelEpochLookupError):
+            inv.get_channel_epoch('N1.XYZ..BHZ', t3)
+        # multiple matches: two epochs covering the same time
+        channels[1].location_code = ''
+        channels[1].start_date = t1
+        inv2 = Inventory(
+            networks=[Network('N1', stations=[Station(
+                code='XYZ', latitude=0.0, longitude=0.0, elevation=0.0,
+                channels=channels[:2])])], source='TEST')
+        with pytest.raises(MultipleMatchingChannelEpochsError):
+            inv2.get_channel_epoch('N1.XYZ..BHZ', t1)
+        with pytest.raises(ChannelEpochLookupError):
+            inv2.get_channel_epoch('N1.XYZ..BHZ', t1)
+        # the regular get_response() is not affected by the strict lookup
+        with pytest.warns(UserWarning):
+            response = inv2.get_response('N1.XYZ..BHZ', t1)
+        assert response is response_1
 
     def test_get_coordinates(self):
         """

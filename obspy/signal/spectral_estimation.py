@@ -52,6 +52,15 @@ NOISE_MODEL_FILE = Path(__file__).parent / "data" / "noise_models.npz"
 # Noise models for special_handling="infrasound"
 NOISE_MODEL_FILE_INF = Path(__file__).parent / "data" / "idc_noise_models.npz"
 
+
+class PPSDRecalibrationError(ObsPyException):
+    """
+    Raised when recalibration of archived PPSD spectra with updated response
+    information fails (see :meth:`PPSD.recalibrate`).
+    """
+    pass
+
+
 earthquake_models = {
     (1.5, 10): [[7.0700000e-01, 1.4140000e+00, 2.8280000e+00, 5.6600000e+00,
                  1.1300000e+01, 2.2600000e+01],
@@ -266,6 +275,59 @@ class PPSD(object):
         correctly taken into account during response removal.
         This is obviously not the case for a static PAZ dictionary!
 
+    .. rubric:: Archiving Spectra for Later Recalibration
+
+    Optionally, the PPSD can archive for every processed time window the
+    spectral information needed to recompute the window's (smoothed and
+    binned) psd values with updated instrument response information at a
+    later time, e.g. when a corrected StationXML file becomes available
+    after the raw waveform data has been cleaned up. This is switched on
+    with ``archive_spectra=True`` together with a non-empty
+    ``metadata_version`` label that identifies the version of the metadata
+    in use (currently only supported for regular seismic channels with
+    metadata given as an
+    :class:`~obspy.core.inventory.inventory.Inventory`):
+
+    >>> ppsd = PPSD(tr.stats, inventory, archive_spectra=True,
+    ...             metadata_version="v1")  # doctest: +SKIP
+
+    For every processed time window, the one-sided, raw (i.e. **not**
+    instrument-corrected) power spectrum is stored as float64 values
+    together with a calibration record (metadata version label, channel SEED
+    ID, the actual time used for the response lookup and the start/end times
+    of the channel epoch that was used). No time-domain data samples are
+    stored. The archive grows with the number of retained time windows and
+    the number of spectral points (``nfft // 2`` float64 values, i.e. 8
+    bytes each, per window), so the npz files get considerably larger than
+    for a plain PPSD (which only stores the much smaller smoothed and
+    binned psd arrays as float32). The float64 representation was chosen
+    because it makes spectra recomputed from the archive bit-exact
+    identical to a fresh computation on the original waveforms (absolute
+    difference of 0.0 dB, far below the required 0.0001 dB); a float32
+    archive would halve the archive size at the cost of a small recompute
+    error (on the order of 1e-6 dB).
+
+    Windows can then be recalibrated with updated metadata (e.g. a corrected
+    StationXML file read into a new
+    :class:`~obspy.core.inventory.inventory.Inventory`) using
+    :meth:`recalibrate`, without changing window times, data coverage or
+    gap statistics, and the histogram is recounted from the updated values.
+    The calibration record of every archived window can be queried with
+    :meth:`get_archive_info`, both in memory and after reloading a saved
+    npz file.
+
+    Regarding npz read-back compatibility: the archive is stored in
+    additional arrays inside the same npz file and the ``ppsd_version``
+    number is left unchanged. Files written with spectra archiving can
+    still be opened with :meth:`load_npz` by ObsPy versions without
+    archiving support (the additional arrays are simply ignored and the
+    PPSD behaves like a plain one), and plain npz files without archive
+    information are loaded as before (with spectra archiving switched off).
+    When combining npz files with :meth:`add_npz`, a PPSD with spectra
+    archiving enabled only accepts npz files that also contain archive
+    information (computed with compatible settings); archive information of
+    merged windows is kept in sync with the windows' psd data.
+
     .. _`ObsPy Tutorial`: https://docs.obspy.org/tutorial/
     """
     NPZ_STORE_KEYS_LIST_TYPES = [
@@ -309,11 +371,32 @@ class PPSD(object):
     NPZ_SIMPLE_TYPE_MAP_R = {v: i for i, v in NPZ_SIMPLE_TYPE_MAP.items()}
     # Add current version as a class attribute to avoid hard coding it.
     _CURRENT_VERSION = 3
+    # Keys for the optional spectra archive (see __init__ keywords
+    # 'archive_spectra' and 'metadata_version' and method 'recalibrate').
+    # These are stored in the npz file in addition to the regular keys (and
+    # only when spectra archiving is enabled), so that npz files stay
+    # readable as plain PPSD results both for older ObsPy versions and when
+    # spectra archiving is not used.
+    NPZ_ARCHIVE_FORMAT_KEY = '_psd_archive_format'
+    NPZ_ARCHIVE_FORMAT_VERSION = 1
+    NPZ_STORE_KEYS_ARCHIVE = [
+        # raw (not instrument corrected) one-sided spectra, one row per
+        # processed time window
+        '_psd_archive_spectra',
+        # per-window calibration records
+        '_psd_archive_versions',
+        '_psd_archive_channel_ids',
+        '_psd_archive_lookup_times',
+        '_psd_archive_epoch_starts',
+        '_psd_archive_epoch_ends',
+        '_psd_archive_epoch_starts_open',
+        '_psd_archive_epoch_ends_open']
 
     def __init__(self, stats, metadata, skip_on_gaps=False,
                  db_bins=(-200, -50, 1.), ppsd_length=3600.0, overlap=0.5,
                  special_handling=None, period_smoothing_width_octaves=1.0,
                  period_step_octaves=0.125, period_limits=None,
+                 archive_spectra=False, metadata_version=None,
                  **kwargs):  # @UnusedVariable
         """
         Initialize the PPSD object setting all fixed information on the station
@@ -397,6 +480,24 @@ class PPSD(object):
             specified period range, no more additional bins will be added after
             the bin whose center frequency exceeds the given upper end for the
             first time.
+        :type archive_spectra: bool
+        :param archive_spectra: If ``True``, archive for every processed time
+            window the spectral information needed to later recompute the
+            window's psd values with updated response information (see
+            :meth:`recalibrate`). Currently only supported for regular
+            seismic channels (i.e. no ``special_handling``) with metadata
+            given as an :class:`~obspy.core.inventory.inventory.Inventory`.
+            See the class documentation ("Archiving Spectra for Later
+            Recalibration") for details on what is stored and on the
+            trade-offs regarding npz read-back compatibility, archive size
+            and recalibration accuracy.
+        :type metadata_version: str
+        :param metadata_version: Non-empty version label identifying the
+            version of the provided metadata (e.g. of the StationXML file
+            the Inventory was read from). Mandatory when
+            ``archive_spectra=True``. The label is stored in the calibration
+            record of every archived time window, so that it can later be
+            told apart which metadata version was used for which window.
         """
         # save things related to args
         self.id = "%(network)s.%(station)s.%(location)s.%(channel)s" % stats
@@ -427,6 +528,25 @@ class PPSD(object):
             msg = "Unsupported value for 'special_handling' parameter: %s"
             msg = msg % self.special_handling
             raise ValueError(msg)
+
+        # set up optional spectra archiving for later recalibration with
+        # updated response information
+        self.archive_spectra = bool(archive_spectra)
+        self.metadata_version = None
+        if self.archive_spectra:
+            if not isinstance(self.metadata, Inventory):
+                msg = ("Spectra archiving ('archive_spectra=True') is "
+                       "currently only supported with metadata provided as "
+                       "an Inventory object, got: %s" % type(self.metadata))
+                raise TypeError(msg)
+            if self.special_handling is not None:
+                msg = ("Spectra archiving ('archive_spectra=True') is "
+                       "currently only supported for regular seismic "
+                       "channels, i.e. without 'special_handling' (got: "
+                       "'%s')." % self.special_handling)
+                raise ValueError(msg)
+            self._validate_metadata_version(metadata_version)
+            self.metadata_version = metadata_version
 
         # save version numbers
         self.ppsd_version = self._CURRENT_VERSION
@@ -473,12 +593,30 @@ class PPSD(object):
         self._times_data = []
         self._times_gaps = []
         self._binned_psds = []
+        # per-window spectra archive for later recalibration (only filled
+        # when 'archive_spectra' is enabled, then always aligned with
+        # '_times_processed' and '_binned_psds')
+        self._psd_archive = []
 
         # internal attributes for stacks on processed data
         self._current_hist_stack = None
         self._current_hist_stack_cumulative = None
         self._current_times_used = []
         self._current_times_all_details = []
+
+    @staticmethod
+    def _validate_metadata_version(metadata_version):
+        """
+        Check that the given metadata version label is a non-empty string,
+        raising a ValueError otherwise.
+        """
+        if not isinstance(metadata_version, str) or \
+                not metadata_version.strip():
+            msg = ("'metadata_version' must be a non-empty string "
+                   "identifying the version of the metadata in use (e.g. of "
+                   "the StationXML file the Inventory was read from), got: "
+                   "%r" % (metadata_version,))
+            raise ValueError(msg)
 
     @property
     def network(self):
@@ -699,7 +837,8 @@ class PPSD(object):
             return False
         return True
 
-    def __insert_processed_data(self, utcdatetime, spectrum):
+    def __insert_processed_data(self, utcdatetime, spectrum,
+                                archive_entry=None):
         """
         Inserts the given UTCDateTime and processed/octave-binned spectrum at
         the right position in the lists, keeping the order intact.
@@ -712,11 +851,22 @@ class PPSD(object):
 
         :type utcdatetime: :class:`~obspy.core.utcdatetime.UTCDateTime`
         :type spectrum: :class:`numpy.ndarray`
+        :type archive_entry: dict or None
+        :param archive_entry: Spectra archive entry belonging to the inserted
+            time window (see :meth:`__process`). Mandatory when spectra
+            archiving is enabled, so that every window's archive entry
+            travels together with its psd data.
         """
+        if self.archive_spectra and archive_entry is None:
+            msg = ("PPSD has spectra archiving enabled, but no archive "
+                   "entry was provided together with the processed data.")
+            raise ValueError(msg)
         t = utcdatetime._ns
         ind = bisect.bisect(self._times_processed, t)
         self._times_processed.insert(ind, t)
         self._binned_psds.insert(ind, spectrum)
+        if self.archive_spectra:
+            self._psd_archive.insert(ind, archive_entry)
 
     def __insert_gap_times(self, stream):
         """
@@ -846,6 +996,13 @@ class PPSD(object):
                    "for processing the data. When using 'PPSD.load_npz()' use "
                    "'metadata' kwarg to provide metadata.")
             raise Exception(msg)
+        if self.archive_spectra:
+            if not isinstance(self.metadata, Inventory):
+                msg = ("PPSD instance has spectra archiving enabled, which "
+                       "requires metadata provided as an Inventory object, "
+                       "got: %s" % type(self.metadata))
+                raise TypeError(msg)
+            self._validate_metadata_version(self.metadata_version)
         # return later if any changes were applied to the ppsd statistics
         changed = False
         # prepare the list of traces to go through
@@ -967,6 +1124,14 @@ class PPSD(object):
         # working with the periods not frequencies later so reverse spectrum
         spec = spec[::-1]
 
+        # when archiving spectra for later recalibration, keep a copy of the
+        # raw (i.e. not instrument corrected) one-sided spectrum. No
+        # time-domain samples are kept, this spectral representation is
+        # sufficient to redo the instrument correction with updated response
+        # information (see recalibrate()).
+        if self.archive_spectra:
+            raw_spectrum = np.array(spec, dtype=np.float64, order="C")
+
         # Here we remove the response using the same conventions
         # since the power is squared we want to square the sensitivity
         # we can also convert to acceleration if we have non-rotational data
@@ -978,7 +1143,14 @@ class PPSD(object):
         else:
             # determine instrument response from metadata
             try:
-                resp = self._get_response(tr)
+                if self.archive_spectra:
+                    # use the strict channel epoch lookup, so that the
+                    # calibration record of the archived window unambiguously
+                    # documents which channel epoch was used
+                    resp, channel_epoch = \
+                        self._get_response_from_inventory_strict(tr)
+                else:
+                    resp = self._get_response(tr)
             except Exception as e:
                 msg = ("Error getting response from provided metadata:\n"
                        "%s: %s\n"
@@ -1000,6 +1172,45 @@ class PPSD(object):
             else:
                 spec = (w ** 2) * spec / respamp
 
+        # clip, convert to dB and smooth/bin into the period binning
+        smoothed_psd = self._bin_spectrum_db(spec)
+
+        if self.archive_spectra:
+            archive_entry = {
+                'spectrum': raw_spectrum,
+                'version': self.metadata_version,
+                'channel_id': self.id,
+                # the actual time at which the response was looked up (start
+                # time of the sliced trace, which can differ slightly from
+                # the window start time 't' on a subsample scale)
+                'lookup_time': tr.stats.starttime._ns,
+                'epoch_start': (channel_epoch.start_date._ns
+                                if channel_epoch.start_date is not None
+                                else None),
+                'epoch_end': (channel_epoch.end_date._ns
+                              if channel_epoch.end_date is not None
+                              else None),
+            }
+        else:
+            archive_entry = None
+        self.__insert_processed_data(t, smoothed_psd,
+                                     archive_entry=archive_entry)
+        return True
+
+    def _bin_spectrum_db(self, spec):
+        """
+        Clip a linear, period-ordered spectrum at a tiny positive value,
+        convert it to dB and smooth/bin it into the period binning of the
+        PPSD. This is the common final processing step of :meth:`__process`
+        and :meth:`recalibrate`, so that spectra recomputed from the spectra
+        archive are computed exactly like during regular processing.
+
+        :type spec: :class:`numpy.ndarray`
+        :param spec: Linear spectrum, ordered like :attr:`psd_periods`. The
+            array is modified in place.
+        :rtype: :class:`numpy.ndarray` (float32)
+        :returns: Smoothed and binned psd values in dB.
+        """
         # avoid calculating log of zero
         idx = spec < dtiny
         spec[idx] = dtiny
@@ -1015,9 +1226,7 @@ class PPSD(object):
             specs = spec[(per_left <= self.psd_periods) &
                          (self.psd_periods <= per_right)]
             smoothed_psd.append(specs.mean())
-        smoothed_psd = np.array(smoothed_psd, dtype=np.float32)
-        self.__insert_processed_data(t, smoothed_psd)
-        return True
+        return np.array(smoothed_psd, dtype=np.float32)
 
     def _get_times_all_details(self):
         # check if we can reuse a previously cached array of all times as
@@ -1288,6 +1497,25 @@ class PPSD(object):
             t_samp=self.delta, nfft=self.nfft, output="VEL")
         return resp
 
+    def _get_response_from_inventory_strict(self, tr):
+        """
+        Get instrument response from Inventory metadata using the strict
+        channel epoch lookup (:meth:`Inventory.get_channel_epoch`), which
+        raises an error if no or more than one matching channel epoch with
+        response information is found.
+
+        :returns: 2-tuple with the response (like
+            :meth:`_get_response_from_inventory`) and the
+            :class:`~obspy.core.inventory.channel.Channel` epoch that was
+            used.
+        """
+        inventory = self.metadata
+        channel_epoch = inventory.get_channel_epoch(self.id,
+                                                    tr.stats.starttime)
+        resp, _ = channel_epoch.response.get_evalresp_response(
+            t_samp=self.delta, nfft=self.nfft, output="VEL")
+        return resp, channel_epoch
+
     def _get_response_from_parser(self, tr):
         parser = self.metadata
         resp_key = "RESP." + self.id
@@ -1373,11 +1601,248 @@ class PPSD(object):
         mean = (hist * self.db_bin_centers / hist_count).sum(axis=1)
         return self.period_bin_centers, mean
 
+    def recalibrate(self, metadata, metadata_version, starttime, endtime):
+        """
+        Recompute archived spectra in a given time span with updated
+        instrument response information.
+
+        This recomputes the psd values of all archived time windows whose
+        start time falls into the half-open interval ``[starttime, endtime)``
+        from their archived raw (not instrument corrected) spectra, using
+        the response information of the given new metadata. It is intended
+        for the case that corrected metadata (e.g. a corrected StationXML
+        file) becomes available after the original waveform data is no
+        longer at hand. The PPSD must have been set up with
+        ``archive_spectra=True`` (see :meth:`PPSD.__init__`).
+
+        For every selected window, the response is looked up in the new
+        metadata with the strict channel epoch lookup
+        (:meth:`obspy.core.inventory.inventory.Inventory.get_channel_epoch`)
+        at the very same time that was used for the response lookup when the
+        window was originally processed (the start time of the sliced data
+        trace, which can differ slightly from the window start time on a
+        subsample scale). The recomputed dB values are identical (up to
+        floating point accuracy, well below 0.0001 dB) to a fresh processing
+        of the same waveform data with the new metadata, since the archived
+        float64 spectra go through the exact same computation steps.
+
+        The operation is atomic: if any of the selected windows misses its
+        archived spectrum, if the response lookup in the new metadata does
+        not yield exactly one valid channel epoch, or if no valid spectrum
+        can be computed, an exception is raised and no spectra, calibration
+        records or histogram stacks are modified at all.
+
+        Windows outside the given time span are left untouched, both their
+        psd values and their calibration records. Window times, their order,
+        data coverage and gap statistics are not changed. The current
+        histogram stack is invalidated, so that it is recounted from the
+        updated psd values on next access. The metadata attached to the PPSD
+        object itself is not modified, i.e. a subsequent :meth:`add` still
+        uses the original metadata.
+
+        :type metadata: :class:`~obspy.core.inventory.inventory.Inventory`
+        :param metadata: New (e.g. corrected) metadata to recompute the
+            selected spectra with.
+        :type metadata_version: str
+        :param metadata_version: Non-empty version label identifying the
+            version of the new metadata. It is stored in the calibration
+            record of every recalibrated window.
+        :type starttime: :class:`~obspy.core.utcdatetime.UTCDateTime`
+        :param starttime: Start of the time span of windows to recalibrate
+            (inclusive), matched against the start times of the archived
+            windows.
+        :type endtime: :class:`~obspy.core.utcdatetime.UTCDateTime`
+        :param endtime: End of the time span of windows to recalibrate
+            (exclusive), matched against the start times of the archived
+            windows.
+        :rtype: list of :class:`~obspy.core.utcdatetime.UTCDateTime`
+        :returns: Start times of the windows that were recalibrated.
+        :raises PPSDRecalibrationError: if spectra archiving is not enabled,
+            if a selected window lacks its archived spectrum, or if no valid
+            spectrum can be computed for a selected window.
+        :raises NoMatchingChannelEpochError: if the new metadata has no
+            channel epoch with response information for a selected window's
+            channel and lookup time.
+        :raises MultipleMatchingChannelEpochsError: if the new metadata has
+            more than one matching channel epoch for a selected window's
+            channel and lookup time.
+        """
+        if not self.archive_spectra:
+            msg = ("PPSD instance was not set up to archive spectra "
+                   "('archive_spectra=True'), so no information is available "
+                   "to recalibrate spectra with updated metadata.")
+            raise PPSDRecalibrationError(msg)
+        if not isinstance(metadata, Inventory):
+            msg = ("Recalibration of archived spectra is currently only "
+                   "supported with metadata provided as an Inventory "
+                   "object, got: %s" % type(metadata))
+            raise TypeError(msg)
+        self._validate_metadata_version(metadata_version)
+        starttime = UTCDateTime(starttime)
+        endtime = UTCDateTime(endtime)
+        if not starttime < endtime:
+            msg = ("'starttime' (%s) must be smaller than 'endtime' (%s), "
+                   "the time span is interpreted as a half-open interval "
+                   "[starttime, endtime) matched against the start times of "
+                   "the archived spectra." % (starttime, endtime))
+            raise ValueError(msg)
+        # select windows to recalibrate by their start time, half-open
+        # interval [starttime, endtime)
+        selected = [i for i, t in enumerate(self._times_processed)
+                    if starttime._ns <= t < endtime._ns]
+        if not selected:
+            msg = ("No archived spectra with start time in half-open "
+                   "interval [%s, %s), nothing to recalibrate."
+                   % (starttime, endtime))
+            warnings.warn(msg)
+            return []
+        # set up the angular frequency array exactly like during regular
+        # processing (see __process), so that recomputed spectra are
+        # identical to a fresh processing of the same data
+        _, _freq = mlab.psd(np.ones(self.len), self.nfft,
+                            self.sampling_rate, noverlap=self.nlap)
+        w = 2.0 * math.pi * _freq[1:]
+        w = w[::-1]
+        # first compute all new spectra and look up all new channel epochs,
+        # so that any problem aborts the whole operation before anything is
+        # modified
+        new_spectra = {}
+        new_channel_epochs = {}
+        for i in selected:
+            t = UTCDateTime(ns=self._times_processed[i])
+            entry = None
+            if i < len(self._psd_archive):
+                entry = self._psd_archive[i]
+            required_keys = ('spectrum', 'version', 'channel_id',
+                             'lookup_time', 'epoch_start', 'epoch_end')
+            if entry is None or \
+                    any(key not in entry for key in required_keys):
+                msg = ("No (complete) archived spectrum information "
+                       "available for time window starting at %s, unable to "
+                       "recalibrate. The whole recalibration is aborted, no "
+                       "data was modified." % str(t))
+                raise PPSDRecalibrationError(msg)
+            spec = np.asarray(entry['spectrum'], dtype=np.float64)
+            if spec.shape != (len(self._psd_periods),):
+                msg = ("Archived spectrum for time window starting at %s "
+                       "has unexpected shape %s (expected %s), unable to "
+                       "recalibrate. The whole recalibration is aborted, "
+                       "no data was modified."
+                       % (str(t), spec.shape, (len(self._psd_periods),)))
+                raise PPSDRecalibrationError(msg)
+            # look up the response in the new metadata at the very same
+            # time that was used for the original response lookup
+            lookup_time = UTCDateTime(ns=entry['lookup_time'])
+            channel_epoch = metadata.get_channel_epoch(
+                entry['channel_id'], lookup_time)
+            try:
+                resp, _ = channel_epoch.response.get_evalresp_response(
+                    t_samp=self.delta, nfft=self.nfft, output="VEL")
+            except Exception as e:
+                msg = ("Error evaluating response of new metadata for time "
+                       "window starting at %s:\n%s: %s\n"
+                       "The whole recalibration is aborted, no data was "
+                       "modified."
+                       % (str(t), e.__class__.__name__, str(e)))
+                raise PPSDRecalibrationError(msg) from e
+            resp = resp[1:]
+            resp = resp[::-1]
+            # Now get the amplitude response (squared)
+            respamp = np.absolute(resp * np.conjugate(resp))
+            # redo the instrument correction on the archived raw spectrum
+            # (regular seismic channels only, see __init__)
+            spec_new = (w ** 2) * spec / respamp
+            binned_psd = self._bin_spectrum_db(spec_new)
+            if np.isnan(binned_psd).any() or \
+                    not np.isfinite(binned_psd).any():
+                msg = ("Unable to compute a valid spectrum for time window "
+                       "starting at %s with the new metadata (result "
+                       "contains NaN or no finite values at all). The whole "
+                       "recalibration is aborted, no data was modified."
+                       % str(t))
+                raise PPSDRecalibrationError(msg)
+            new_spectra[i] = binned_psd
+            new_channel_epochs[i] = channel_epoch
+        # all computations succeeded, now apply the changes
+        for i in selected:
+            self._binned_psds[i] = new_spectra[i]
+            entry = self._psd_archive[i]
+            channel_epoch = new_channel_epochs[i]
+            entry['version'] = metadata_version
+            entry['epoch_start'] = (channel_epoch.start_date._ns
+                                    if channel_epoch.start_date is not None
+                                    else None)
+            entry['epoch_end'] = (channel_epoch.end_date._ns
+                                  if channel_epoch.end_date is not None
+                                  else None)
+        # invalidate the current histogram stack, so it gets recounted from
+        # the updated psd values on next access
+        self.__invalidate_histogram()
+        return [UTCDateTime(ns=self._times_processed[i]) for i in selected]
+
+    def get_archive_info(self, starttime=None):
+        """
+        Get calibration records of archived spectra.
+
+        Only usable when the PPSD was set up with ``archive_spectra=True``
+        (or loaded from an npz file with spectra archive information).
+
+        :type starttime: :class:`~obspy.core.utcdatetime.UTCDateTime`,
+            optional
+        :param starttime: If given, return only the calibration record of
+            the archived spectrum with exactly this start time.
+        :rtype: dict or list of dict
+        :returns: Calibration record(s) with keys ``'version'`` (metadata
+            version label), ``'channel_id'`` (SEED ID the response was
+            looked up for), ``'lookup_time'`` (the actual time at which the
+            response was looked up, as
+            :class:`~obspy.core.utcdatetime.UTCDateTime`) and
+            ``'epoch_start'``/``'epoch_end'`` (validity time span of the
+            channel epoch that was used, as
+            :class:`~obspy.core.utcdatetime.UTCDateTime` or ``None`` for an
+            open end).
+        """
+        if not self.archive_spectra:
+            msg = ("PPSD instance was not set up to archive spectra "
+                   "('archive_spectra=True'), no calibration records "
+                   "available.")
+            raise PPSDRecalibrationError(msg)
+
+        def _info(entry):
+            epoch_start = entry['epoch_start']
+            if epoch_start is not None:
+                epoch_start = UTCDateTime(ns=epoch_start)
+            epoch_end = entry['epoch_end']
+            if epoch_end is not None:
+                epoch_end = UTCDateTime(ns=epoch_end)
+            return {'version': entry['version'],
+                    'channel_id': entry['channel_id'],
+                    'lookup_time': UTCDateTime(ns=entry['lookup_time']),
+                    'epoch_start': epoch_start,
+                    'epoch_end': epoch_end}
+
+        if starttime is None:
+            return [_info(entry) for entry in self._psd_archive]
+        t = UTCDateTime(starttime)._ns
+        index = bisect.bisect_left(self._times_processed, t)
+        if index >= len(self._times_processed) or \
+                self._times_processed[index] != t:
+            msg = ("No archived spectrum with start time %s."
+                   % str(UTCDateTime(starttime)))
+            raise KeyError(msg)
+        return _info(self._psd_archive[index])
+
     def save_npz(self, filename):
         """
         Saves the PPSD as a compressed numpy binary (npz format).
 
         The resulting file can be restored using `my_ppsd.load_npz(filename)`.
+
+        If spectra archiving is enabled (see :meth:`PPSD.__init__`), the
+        spectra archive is stored in additional arrays in the same npz file.
+        The file can still be loaded as a plain PPSD by ObsPy versions
+        without spectra archiving support (the additional arrays are ignored
+        then).
 
         :type filename: str
         :param filename: Name of numpy .npz output file
@@ -1390,10 +1855,117 @@ class PPSD(object):
             if key in self.NPZ_STORE_KEYS_SIMPLE_TYPES:
                 value = self.NPZ_SIMPLE_TYPE_MAP.get(value, value)
             out[key] = value
+        if self.archive_spectra:
+            out.update(self._archive_npz_arrays())
         np.savez_compressed(filename, **out)
 
+    def _archive_npz_arrays(self):
+        """
+        Convert the per-window spectra archive into a dictionary of numpy
+        arrays for storage in the npz file (see :meth:`save_npz`).
+        """
+        count = len(self._psd_archive)
+        spectra = np.empty((count, len(self._psd_periods)),
+                           dtype=np.float64)
+        lookup_times = np.zeros(count, dtype=np.int64)
+        epoch_starts = np.zeros(count, dtype=np.int64)
+        epoch_ends = np.zeros(count, dtype=np.int64)
+        epoch_starts_open = np.zeros(count, dtype=np.bool_)
+        epoch_ends_open = np.zeros(count, dtype=np.bool_)
+        versions = []
+        channel_ids = []
+        for i, entry in enumerate(self._psd_archive):
+            spectra[i] = entry['spectrum']
+            versions.append(entry['version'])
+            channel_ids.append(entry['channel_id'])
+            lookup_times[i] = entry['lookup_time']
+            if entry['epoch_start'] is None:
+                epoch_starts_open[i] = True
+            else:
+                epoch_starts[i] = entry['epoch_start']
+            if entry['epoch_end'] is None:
+                epoch_ends_open[i] = True
+            else:
+                epoch_ends[i] = entry['epoch_end']
+        out = {
+            self.NPZ_ARCHIVE_FORMAT_KEY:
+                np.int64(self.NPZ_ARCHIVE_FORMAT_VERSION),
+            '_psd_archive_spectra': spectra,
+            '_psd_archive_versions': np.array(versions),
+            '_psd_archive_channel_ids': np.array(channel_ids),
+            '_psd_archive_lookup_times': lookup_times,
+            '_psd_archive_epoch_starts': epoch_starts,
+            '_psd_archive_epoch_ends': epoch_ends,
+            '_psd_archive_epoch_starts_open': epoch_starts_open,
+            '_psd_archive_epoch_ends_open': epoch_ends_open,
+        }
+        return out
+
     @staticmethod
-    def load_npz(filename, metadata=None, allow_pickle=False):
+    def _read_archive_npz(data):
+        """
+        Read spectra archive entries from an open npz file (see
+        :meth:`load_npz` and :meth:`_add_npz`).
+
+        :returns: List of per-window spectra archive entry dictionaries, or
+            ``None`` if the npz file does not contain spectra archive
+            information.
+        :raises ValueError: if the spectra archive information in the npz
+            file is inconsistent.
+        """
+        if PPSD.NPZ_ARCHIVE_FORMAT_KEY not in data:
+            return None
+        format_version = int(data[PPSD.NPZ_ARCHIVE_FORMAT_KEY].item())
+        if format_version != PPSD.NPZ_ARCHIVE_FORMAT_VERSION:
+            msg = ("Unsupported PPSD spectra archive format version %d in "
+                   "npz file (this ObsPy version supports version %d)."
+                   % (format_version, PPSD.NPZ_ARCHIVE_FORMAT_VERSION))
+            raise ValueError(msg)
+        spectra = data['_psd_archive_spectra']
+        count = spectra.shape[0]
+        if spectra.shape != (count, len(data['_psd_periods'])):
+            msg = ("Inconsistent spectra archive in npz file: archived "
+                   "spectra have shape %s, but %d spectral points were "
+                   "expected from the stored psd periods."
+                   % (spectra.shape, len(data['_psd_periods'])))
+            raise ValueError(msg)
+        versions = [str(v) for v in data['_psd_archive_versions'].tolist()]
+        channel_ids = [str(v)
+                       for v in data['_psd_archive_channel_ids'].tolist()]
+        lookup_times = data['_psd_archive_lookup_times'].tolist()
+        epoch_starts = data['_psd_archive_epoch_starts'].tolist()
+        epoch_ends = data['_psd_archive_epoch_ends'].tolist()
+        epoch_starts_open = data['_psd_archive_epoch_starts_open'].tolist()
+        epoch_ends_open = data['_psd_archive_epoch_ends_open'].tolist()
+        for key, values in (('versions', versions),
+                            ('channel_ids', channel_ids),
+                            ('lookup_times', lookup_times),
+                            ('epoch_starts', epoch_starts),
+                            ('epoch_ends', epoch_ends),
+                            ('epoch_starts_open', epoch_starts_open),
+                            ('epoch_ends_open', epoch_ends_open)):
+            if len(values) != count:
+                msg = ("Inconsistent spectra archive in npz file: %d "
+                       "archived spectra but %d entries in '%s'."
+                       % (count, len(values), key))
+                raise ValueError(msg)
+        entries = []
+        for i in range(count):
+            entries.append({
+                'spectrum': np.asarray(spectra[i], dtype=np.float64),
+                'version': versions[i],
+                'channel_id': channel_ids[i],
+                'lookup_time': int(lookup_times[i]),
+                'epoch_start': (None if epoch_starts_open[i]
+                                else int(epoch_starts[i])),
+                'epoch_end': (None if epoch_ends_open[i]
+                              else int(epoch_ends[i])),
+            })
+        return entries
+
+    @staticmethod
+    def load_npz(filename, metadata=None, allow_pickle=False,
+                 metadata_version=None):
         """
         Load previously computed PPSD results.
 
@@ -1415,6 +1987,15 @@ class PPSD(object):
             Allow the pickle protocol to be used when de-serializing saved
             PPSDs. This is only required for npz files written by ObsPy
             versions less than 1.2.0.
+        :type metadata_version: str
+        :param metadata_version: Non-empty version label identifying the
+            version of the metadata provided with the `metadata` kwarg. Only
+            relevant when the loaded npz file contains spectra archive
+            information (see :meth:`PPSD.__init__`): it is used for the
+            calibration record of windows that get archived when more data
+            is processed with :meth:`add` afterwards. If not given,
+            :meth:`add` will raise an error until a valid
+            :attr:`metadata_version` is set on the object.
         """
         def _load(data):
             # the information regarding stats is set from the npz
@@ -1454,12 +2035,32 @@ class PPSD(object):
                 setattr(ppsd, key, data_)
             # we converted all data, so update ppsd version
             ppsd.ppsd_version = PPSD._CURRENT_VERSION
+            # load spectra archive information, if present in the npz file
+            archive_entries = PPSD._read_archive_npz(data)
+            if archive_entries is not None:
+                if len(archive_entries) != len(ppsd._times_processed):
+                    msg = ("Inconsistent spectra archive in npz file: %d "
+                           "archive entries for %d processed time windows."
+                           % (len(archive_entries),
+                              len(ppsd._times_processed)))
+                    raise ValueError(msg)
+                ppsd._psd_archive = archive_entries
+                ppsd.archive_spectra = True
+            if metadata_version is not None:
+                PPSD._validate_metadata_version(metadata_version)
+                ppsd.metadata_version = metadata_version
             return ppsd
 
         try:
             with np.load(filename, allow_pickle=allow_pickle) as data:
                 return _load(data)
-        except ValueError:
+        except ValueError as e:
+            # re-raise errors that are unrelated to the pickle protocol
+            # issue of very old npz files (e.g. inconsistent spectra archive
+            # information)
+            if "allow_pickle" not in str(e) and \
+                    "Object arrays cannot be loaded" not in str(e):
+                raise
             msg = ("Loading PPSD results saved with ObsPy versions < "
                    "1.2 requires setting the allow_pickle parameter "
                    "of PPSD.load_npz to True")
@@ -1476,6 +2077,13 @@ class PPSD(object):
         Before adding the data it is checked if the data was computed with the
         same settings, then any time periods that are not yet covered are added
         to the current PPSD (a warning is emitted if any segments are omitted).
+
+        If the current PPSD instance has spectra archiving enabled (see
+        :meth:`PPSD.__init__`), only npz files that also contain spectra
+        archive information can be added; the archive entries of merged
+        windows are kept in sync with the windows' psd data. Spectra archive
+        information in files added to a PPSD without spectra archiving is
+        discarded (with a warning).
 
         :type filename: str
         :param filename: Name of numpy .npz file(s) with stored PPSD data.
@@ -1533,16 +2141,46 @@ class PPSD(object):
                                for start, end in _times_gaps]
                 _times_processed = [
                     UTCDateTime(t)._ns for t in _times_processed]
+            # load spectra archive information, if present in the npz file
+            archive_entries = PPSD._read_archive_npz(data)
+            if archive_entries is not None and \
+                    len(archive_entries) != len(_times_processed):
+                msg = ("Inconsistent spectra archive in npz file '%s': %d "
+                       "archive entries for %d processed time windows."
+                       % (filename, len(archive_entries),
+                          len(_times_processed)))
+                raise ValueError(msg)
+            if self.archive_spectra:
+                # a PPSD with spectra archiving enabled only accepts npz
+                # files that also carry spectra archive information
+                if archive_entries is None:
+                    msg = ("Cannot add PPSD results from file '%s': the "
+                           "current PPSD instance has spectra archiving "
+                           "enabled, but the file does not contain spectra "
+                           "archive information." % filename)
+                    raise ValueError(msg)
+            elif archive_entries is not None:
+                msg = ("Discarding spectra archive information of file '%s' "
+                       "because the current PPSD instance does not have "
+                       "spectra archiving enabled." % filename)
+                warnings.warn(msg)
+                archive_entries = None
             # add new data
             self._times_data.extend(_times_data)
             self._times_gaps.extend(_times_gaps)
             duplicates = 0
-            for t, psd in zip(_times_processed, _binned_psds):
+            for i, (t, psd) in enumerate(zip(_times_processed, _binned_psds)):
                 t = UTCDateTime(ns=t)
                 if self.__check_time_present(t):
                     duplicates += 1
                     continue
-                self.__insert_processed_data(t, psd)
+                archive_entry = None
+                if archive_entries is not None:
+                    archive_entry = archive_entries[i]
+                # insert the window's archive entry (if any) together with
+                # its psd data, so both stay in sync
+                self.__insert_processed_data(t, psd,
+                                             archive_entry=archive_entry)
             # warn if some segments were omitted
             if duplicates:
                 msg = ("%d/%d segments omitted in file '%s' "
@@ -1553,7 +2191,13 @@ class PPSD(object):
         try:
             with np.load(filename, allow_pickle=allow_pickle) as data:
                 _add(data)
-        except ValueError:
+        except ValueError as e:
+            # re-raise errors that are unrelated to the pickle protocol
+            # issue of very old npz files (e.g. missing or inconsistent
+            # spectra archive information)
+            if "allow_pickle" not in str(e) and \
+                    "Object arrays cannot be loaded" not in str(e):
+                raise
             msg = ("Loading PPSD results saved with ObsPy versions < "
                    "1.2 requires setting the allow_pickle parameter "
                    "of PPSD.load_npz to True")

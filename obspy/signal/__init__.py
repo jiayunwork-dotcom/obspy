@@ -194,7 +194,7 @@ and the same page in the `Tutorial`_. For automated use see the following
 if "filter" in locals():
     del filter
 
-from .spectral_estimation import PPSD
+from .spectral_estimation import PPSD, PPSDRecalibrationError
 
 
 if __name__ == '__main__':

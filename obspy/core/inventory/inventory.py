@@ -102,6 +102,30 @@ def _read(filename, format=None, **kwargs):
     return inventory
 
 
+class ChannelEpochLookupError(ObsPyException):
+    """
+    Base class for errors raised by the strict channel epoch lookup
+    :meth:`Inventory.get_channel_epoch`.
+    """
+    pass
+
+
+class NoMatchingChannelEpochError(ChannelEpochLookupError):
+    """
+    Raised by :meth:`Inventory.get_channel_epoch` when no channel epoch with
+    response information matches the given SEED ID and time.
+    """
+    pass
+
+
+class MultipleMatchingChannelEpochsError(ChannelEpochLookupError):
+    """
+    Raised by :meth:`Inventory.get_channel_epoch` when more than one channel
+    epoch with response information matches the given SEED ID and time.
+    """
+    pass
+
+
 class Inventory(ComparingObject):
     """
     The root object of the
@@ -453,6 +477,94 @@ class Inventory(ComparingObject):
             msg = "No matching response information found."
             raise Exception(msg)
         return responses[0]
+
+    def get_channel_epoch(self, seed_id, datetime):
+        """
+        Strictly find the unique channel epoch carrying response information
+        for a given channel at a given time.
+
+        In contrast to :meth:`get_response`, which warns and returns the first
+        match when several channel epochs match, this method is strict: it
+        returns the one and only matching
+        :class:`~obspy.core.inventory.channel.Channel` epoch that has a
+        :class:`~obspy.core.inventory.response.Response` attached and raises
+        dedicated exceptions when there is no or more than one match. This is
+        useful to unambiguously determine which channel epoch's response would
+        be (or was) used for a given point in time, e.g. before relying on it
+        for instrument correction.
+
+        Matching of the channel epoch's validity time span follows the same
+        rules as the existing response lookup (see
+        :meth:`obspy.core.inventory.network.Network.get_response`): the epoch
+        matches if ``start_date <= datetime <= end_date``, and an unset
+        ``start_date``/``end_date`` means the epoch is open towards the
+        past/future, respectively.
+
+        >>> from obspy import read_inventory, UTCDateTime
+        >>> inventory = read_inventory()
+        >>> datetime = UTCDateTime("2010-01-01T00:00:00")
+        >>> channel = inventory.get_channel_epoch("BW.RJOB..EHZ", datetime)
+        >>> print(channel)  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+        Channel 'EHZ', Location ''
+            Time range: 2007-12-17T00:00:00.000000Z - --
+            Latitude: ..., Longitude: ..., Elevation: ... m, Local Depth: ... m
+            Azimuth: ... degrees from north, clockwise
+            Dip: ... degrees down from horizontal
+            Channel types: ...
+            Sampling Rate: 200.00 Hz
+            Sensor (Description): Streckeisen STS-2/N seismometer (...)
+            Response information available
+
+        :type seed_id: str
+        :param seed_id: SEED ID string of channel to get the channel epoch
+            for (full ID, i.e. ``"network.station.location.channel"``).
+        :type datetime: :class:`~obspy.core.utcdatetime.UTCDateTime`
+        :param datetime: Time to get the channel epoch for.
+        :rtype: :class:`~obspy.core.inventory.channel.Channel`
+        :returns: The unique channel epoch with response information matching
+            the given SEED ID and time.
+        :raises NoMatchingChannelEpochError: if no channel epoch with
+            response information matches.
+        :raises MultipleMatchingChannelEpochsError: if more than one channel
+            epoch with response information matches.
+        """
+        network, station, location, channel = seed_id.split(".")
+
+        matches = []
+        for net in self.networks:
+            if net.code != network:
+                continue
+            for sta in net.stations:
+                if sta.code != station:
+                    continue
+                for cha in sta.channels:
+                    if cha.code != channel:
+                        continue
+                    if cha.location_code != location:
+                        continue
+                    # same endpoint matching rules as in
+                    # Network.get_response(): closed interval, open ends when
+                    # start/end date are not set
+                    if cha.start_date is not None and \
+                            cha.start_date > datetime:
+                        continue
+                    if cha.end_date is not None and \
+                            cha.end_date < datetime:
+                        continue
+                    if cha.response is None:
+                        continue
+                    matches.append(cha)
+        if not matches:
+            msg = ("No channel epoch with response information found for "
+                   "seed id '%s' at time %s." % (seed_id, str(datetime)))
+            raise NoMatchingChannelEpochError(msg)
+        if len(matches) > 1:
+            msg = ("Found more than one channel epoch with response "
+                   "information for seed id '%s' at time %s. Refusing to "
+                   "pick one of the %d matching epochs."
+                   % (seed_id, str(datetime), len(matches)))
+            raise MultipleMatchingChannelEpochsError(msg)
+        return matches[0]
 
     def get_channel_metadata(self, seed_id, datetime=None):
         """

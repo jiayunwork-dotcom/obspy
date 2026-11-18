@@ -14,12 +14,14 @@ import pytest
 
 from obspy import Stream, Trace, UTCDateTime, read, read_inventory, Inventory
 from obspy.core import Stats
-from obspy.core.inventory import Response
+from obspy.core.inventory import (Response, NoMatchingChannelEpochError,
+                                  MultipleMatchingChannelEpochsError)
 from obspy.core.util import CatchAndAssertWarnings
 from obspy.core.util.base import NamedTemporaryFile
 from obspy.core.util.obspy_types import ObsPyException
 from obspy.io.xseed import Parser
-from obspy.signal.spectral_estimation import (PPSD, welch_taper, welch_window)
+from obspy.signal.spectral_estimation import (PPSD, PPSDRecalibrationError,
+                                              welch_taper, welch_window)
 from obspy.signal.spectral_estimation import earthquake_models
 from obspy.signal.spectral_estimation import get_idc_infra_low_noise
 from obspy.signal.spectral_estimation import get_idc_infra_hi_noise
@@ -913,3 +915,662 @@ class TestPsd:
         assert not len(ppsd.times_processed)  # should be empty, nothing added
         # contains start/end times of traces added in, even if not processed
         assert len(ppsd.times_data) == 1
+
+
+# two genuinely different instrument responses for recalibration tests
+_PPSD_TEST_POLES_V1 = [(-0.037004 + 0.037016j), (-0.037004 - 0.037016j),
+                       (-251.33 + 0j), (-131.04 - 467.29j),
+                       (-131.04 + 467.29j)]
+_PPSD_TEST_POLES_V2 = [(-0.08 + 0.06j), (-0.08 - 0.06j),
+                       (-180.0 + 0j), (-90.0 - 350.0j), (-90.0 + 350.0j)]
+
+
+def _make_ppsd_test_inventory(poles=_PPSD_TEST_POLES_V1, gain=60077000.0,
+                              sensitivity=2516778400.0, location="",
+                              start_date=None, end_date=None):
+    """
+    Set up a simple one-channel inventory with a two-stage (PAZ + gain)
+    response for PPSD recalibration testing.
+    """
+    from obspy.core.inventory import (Network, Station, Channel, Response,
+                                      InstrumentSensitivity)
+    from obspy.core.inventory.response import (PolesZerosResponseStage,
+                                               ResponseStage)
+    paz_stage = PolesZerosResponseStage(
+        stage_sequence_number=1, stage_gain=gain, stage_gain_frequency=1.0,
+        input_units="M/S", output_units="V",
+        pz_transfer_function_type="LAPLACE (RADIANS/SECOND)",
+        normalization_frequency=1.0, zeros=[0j, 0j], poles=poles,
+        normalization_factor=1.0)
+    gain_stage = ResponseStage(
+        stage_sequence_number=2, stage_gain=sensitivity / gain,
+        stage_gain_frequency=1.0, input_units="V", output_units="COUNTS")
+    response = Response(
+        resource_id="TEST_RESPONSE",
+        instrument_sensitivity=InstrumentSensitivity(
+            sensitivity, 1.0, "M/S", "COUNTS"),
+        response_stages=[paz_stage, gain_stage])
+    channel = Channel(code="BHZ", location_code=location, latitude=0.0,
+                      longitude=0.0, elevation=0.0, depth=0.0,
+                      response=response, start_date=start_date,
+                      end_date=end_date, sample_rate=20.0)
+    station = Station(code="TEST", latitude=0.0, longitude=0.0, elevation=0.0,
+                      channels=[channel])
+    return Inventory(networks=[Network(code="XX", stations=[station])],
+                     source="TEST")
+
+
+def _make_ppsd_test_trace(starttime=UTCDateTime("2011-03-31T00:00:00"),
+                          sampling_rate=20.0, duration=3600.0, seed=42,
+                          location=""):
+    """
+    Make a synthetic noise trace with psd values well inside the default
+    dB binning of the PPSD.
+    """
+    rng = np.random.RandomState(seed)
+    data = rng.randn(int(duration * sampling_rate)) * 1e-5
+    tr = Trace(data=data)
+    tr.stats.network = "XX"
+    tr.stats.station = "TEST"
+    tr.stats.location = location
+    tr.stats.channel = "BHZ"
+    tr.stats.sampling_rate = sampling_rate
+    tr.stats.starttime = starttime
+    return tr
+
+
+@pytest.fixture(scope="function")
+def _archive_ppsd():
+    """
+    Returns trace and two inventory versions (with genuinely different
+    frequency responses) for PPSD recalibration tests.
+    """
+    tr = _make_ppsd_test_trace()
+    inv_v1 = _make_ppsd_test_inventory(
+        poles=_PPSD_TEST_POLES_V1, gain=60077000.0, sensitivity=2516778400.0,
+        start_date=UTCDateTime("2010-01-01"))
+    inv_v2 = _make_ppsd_test_inventory(
+        poles=_PPSD_TEST_POLES_V2, gain=900000.0, sensitivity=1500000000.0,
+        start_date=UTCDateTime("2010-01-01"))
+    return tr, inv_v1, inv_v2
+
+
+@pytest.mark.usefixtures('ignore_numpy_errors')
+class TestPPSDRecalibration:
+    """
+    Test cases for PPSD spectra archiving and recalibration with updated
+    response information.
+    """
+    def test_archive_init_validation(self, _archive_ppsd):
+        """
+        Test validation of the spectra archiving related __init__ options.
+        """
+        tr, inv_v1, _ = _archive_ppsd
+        # plain PPSD has no archiving
+        ppsd = PPSD(tr.stats, inv_v1)
+        assert ppsd.archive_spectra is False
+        # archiving requires Inventory metadata
+        paz = {'gain': 60077000.0, 'poles': _PPSD_TEST_POLES_V1,
+               'sensitivity': 2516778400.0, 'zeros': [0j, 0j]}
+        with pytest.raises(TypeError, match="Inventory"):
+            PPSD(tr.stats, paz, archive_spectra=True, metadata_version="v1")
+        # archiving requires a non-empty metadata version label
+        for version in (None, "", "   ", 5):
+            with pytest.raises(ValueError, match="metadata_version"):
+                PPSD(tr.stats, inv_v1, archive_spectra=True,
+                     metadata_version=version)
+        # archiving is only supported for regular seismic channels
+        with pytest.raises(ValueError, match="special_handling"):
+            PPSD(tr.stats, inv_v1, archive_spectra=True,
+                 metadata_version="v1", special_handling="hydrophone")
+        # valid setup
+        ppsd = PPSD(tr.stats, inv_v1, archive_spectra=True,
+                    metadata_version="v1")
+        assert ppsd.archive_spectra is True
+        assert ppsd.metadata_version == "v1"
+
+    def test_recalibrate(self, _archive_ppsd):
+        """
+        Test recalibration of archived spectra with updated metadata.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        assert len(ppsd.times_processed) == 11
+        # cache the histogram before recalibration
+        ppsd.calculate_histogram()
+        hist_before = ppsd.current_histogram.copy()
+        values_before = [np.array(v) for v in ppsd.psd_values]
+        times_before = list(ppsd.times_processed)
+        times_data_before = list(ppsd.times_data)
+        times_gaps_before = list(ppsd.times_gaps)
+
+        # recalibrate only the middle windows, half-open interval
+        times = ppsd.times_processed
+        t_start, t_end = times[2], times[5]
+        updated = ppsd.recalibrate(inv_v2, "v2", t_start, t_end)
+        assert updated == times[2:5]
+
+        # reference: fresh computation of the same data with the new
+        # metadata and identical settings
+        ppsd_ref = PPSD(tr.stats, inv_v2, ppsd_length=600.0, overlap=0.5)
+        ppsd_ref.add(tr)
+        ref = {t._ns: v for t, v in zip(ppsd_ref.times_processed,
+                                        ppsd_ref.psd_values)}
+        for t, value in zip(ppsd.times_processed, ppsd.psd_values):
+            if t_start <= t < t_end:
+                diff = np.abs(np.asarray(value, dtype=np.float64) -
+                              np.asarray(ref[t._ns], dtype=np.float64))
+                finite = np.isfinite(diff)
+                assert diff[finite].max() <= 1e-4
+                # float64 archive makes the recalibration bit-exact
+                assert diff[finite].max() == 0.0
+            else:
+                # windows outside the interval are untouched
+                i = times_before.index(t)
+                np.testing.assert_array_equal(value, values_before[i])
+
+        # window identity, order, data coverage and gap stats unchanged
+        assert ppsd.times_processed == times_before
+        assert ppsd.times_data == times_data_before
+        assert ppsd.times_gaps == times_gaps_before
+
+        # calibration records: updated inside, untouched outside
+        for t, info in zip(ppsd.times_processed, ppsd.get_archive_info()):
+            assert info['channel_id'] == "XX.TEST..BHZ"
+            assert info['lookup_time'] == t
+            assert info['epoch_start'] == UTCDateTime("2010-01-01")
+            assert info['epoch_end'] is None
+            if t_start <= t < t_end:
+                assert info['version'] == "v2"
+            else:
+                assert info['version'] == "v1"
+
+        # histogram is recounted from the updated values
+        hist_after = ppsd.current_histogram
+        assert not np.array_equal(hist_before, hist_after)
+        ppsd.calculate_histogram()
+        np.testing.assert_array_equal(hist_after, ppsd.current_histogram)
+
+        # metadata of the PPSD object itself is unchanged, so newly added
+        # data is processed with the original metadata again
+        tr2 = _make_ppsd_test_trace(
+            starttime=tr.stats.starttime + 3600, seed=43)
+        ppsd.add(tr2)
+        new_times = [t for t in ppsd.times_processed
+                     if t >= tr2.stats.starttime]
+        assert len(new_times) > 0
+        for t in new_times:
+            assert ppsd.get_archive_info(t)['version'] == "v1"
+
+    def test_recalibrate_requires_archive(self, _archive_ppsd):
+        """
+        Recalibration must raise a clear error on a PPSD without spectra
+        archive.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5)
+        ppsd.add(tr)
+        with pytest.raises(PPSDRecalibrationError, match="archive"):
+            ppsd.recalibrate(inv_v2, "v2", ppsd.times_processed[0],
+                             ppsd.times_processed[1])
+        with pytest.raises(PPSDRecalibrationError, match="archive"):
+            ppsd.get_archive_info()
+
+    def test_recalibrate_argument_validation(self, _archive_ppsd):
+        """
+        Test validation of the recalibrate() arguments.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        t0 = ppsd.times_processed[0]
+        t1 = ppsd.times_processed[1]
+        # metadata must be an Inventory
+        with pytest.raises(TypeError, match="Inventory"):
+            ppsd.recalibrate({'gain': 1.0}, "v2", t0, t1)
+        # version label must be non-empty
+        for version in (None, "", "  ", 3):
+            with pytest.raises(ValueError, match="metadata_version"):
+                ppsd.recalibrate(inv_v2, version, t0, t1)
+        # empty time span is rejected
+        with pytest.raises(ValueError, match="starttime"):
+            ppsd.recalibrate(inv_v2, "v2", t1, t0)
+        with pytest.raises(ValueError, match="starttime"):
+            ppsd.recalibrate(inv_v2, "v2", t0, t0)
+        # time span without any windows: warning and empty result
+        with pytest.warns(UserWarning, match="nothing to recalibrate"):
+            assert ppsd.recalibrate(inv_v2, "v2", t0 - 7200,
+                                    t0 - 3600) == []
+
+    def _assert_ppsd_state(self, ppsd, values, infos, hist):
+        """
+        Helper to check that psd values, calibration records and the
+        (cached) histogram of a PPSD are in the expected state.
+        """
+        for value, expected in zip(ppsd.psd_values, values):
+            np.testing.assert_array_equal(value, expected)
+        for info, expected in zip(ppsd.get_archive_info(), infos):
+            assert info == expected
+        np.testing.assert_array_equal(ppsd.current_histogram, hist)
+
+    def test_recalibrate_epoch_gap_atomicity(self, _archive_ppsd):
+        """
+        A missing channel epoch in the new metadata must abort the whole
+        recalibration without changing anything.
+        """
+        tr, inv_v1, _ = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        ppsd.calculate_histogram()
+        values_before = [np.array(v) for v in ppsd.psd_values]
+        infos_before = ppsd.get_archive_info()
+        hist_before = ppsd.current_histogram.copy()
+
+        times = ppsd.times_processed
+        # new metadata has an epoch gap covering one of the selected windows
+        inv_gap = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V2, gain=900000.0, sensitivity=1500000000.0,
+            start_date=times[6], end_date=times[8])
+        with pytest.raises(NoMatchingChannelEpochError):
+            ppsd.recalibrate(inv_gap, "v2", times[2], times[5])
+        # nothing was modified
+        self._assert_ppsd_state(ppsd, values_before, infos_before, hist_before)
+
+    def test_recalibrate_epoch_overlap_atomicity(self, _archive_ppsd):
+        """
+        Overlapping channel epochs in the new metadata must abort the whole
+        recalibration without changing anything.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        ppsd.calculate_histogram()
+        values_before = [np.array(v) for v in ppsd.psd_values]
+        infos_before = ppsd.get_archive_info()
+        hist_before = ppsd.current_histogram.copy()
+
+        times = ppsd.times_processed
+        # add a second, overlapping channel epoch to the new metadata
+        channel2 = deepcopy(inv_v2[0][0].channels[0])
+        inv_v2[0][0].channels.append(channel2)
+        with pytest.raises(MultipleMatchingChannelEpochsError):
+            ppsd.recalibrate(inv_v2, "v2", times[2], times[5])
+        # nothing was modified
+        self._assert_ppsd_state(ppsd, values_before, infos_before, hist_before)
+
+    def test_recalibrate_invalid_spectrum_atomicity(self, _archive_ppsd):
+        """
+        A response that does not yield a valid spectrum must abort the whole
+        recalibration without changing anything.
+        """
+        tr, inv_v1, _ = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        ppsd.calculate_histogram()
+        values_before = [np.array(v) for v in ppsd.psd_values]
+        infos_before = ppsd.get_archive_info()
+        hist_before = ppsd.current_histogram.copy()
+
+        times = ppsd.times_processed
+        # broken metadata: zero overall sensitivity, no valid spectrum can
+        # be computed from it
+        inv_broken = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V2, gain=1.0, sensitivity=0.0,
+            start_date=UTCDateTime("2010-01-01"))
+        with pytest.raises(PPSDRecalibrationError):
+            ppsd.recalibrate(inv_broken, "v2", times[2], times[5])
+        # nothing was modified
+        self._assert_ppsd_state(ppsd, values_before, infos_before, hist_before)
+
+    def test_recalibrate_missing_archive_info(self, _archive_ppsd):
+        """
+        Windows without (complete) archived spectrum information must abort
+        the recalibration with a clear error.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        times = ppsd.times_processed
+        # simulate a window that lacks its archived spectrum
+        ppsd._psd_archive[3] = None
+        with pytest.raises(PPSDRecalibrationError, match="archive"):
+            ppsd.recalibrate(inv_v2, "v2", times[2], times[5])
+        # windows outside the corrupted range can still be recalibrated
+        ppsd.recalibrate(inv_v2, "v2", times[0], times[1])
+        assert ppsd.get_archive_info(times[0])['version'] == "v2"
+        # a truncated archive also raises a clear error
+        ppsd._psd_archive = ppsd._psd_archive[:2]
+        with pytest.raises(PPSDRecalibrationError, match="archive"):
+            ppsd.recalibrate(inv_v2, "v2", times[0], times[5])
+
+    def test_recalibrate_lookup_time_offset(self):
+        """
+        The response lookup during recalibration must use the original
+        lookup time (start time of the sliced data trace), which can differ
+        from the archived window start time on a subsample scale.
+        """
+        # with a step of 50.5 s and 1 Hz sampling, every other window start
+        # falls in between two samples and the sliced trace start time
+        # differs from the window start time
+        tr = _make_ppsd_test_trace(sampling_rate=1.0, duration=400.0)
+        inv_v1 = _make_ppsd_test_inventory(
+            start_date=UTCDateTime("2010-01-01"))
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=101.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        infos = ppsd.get_archive_info()
+        times = ppsd.times_processed
+        # find a window where lookup time and window start time differ
+        i_offset = None
+        for i, (t, info) in enumerate(zip(times, infos)):
+            if info['lookup_time'] != t:
+                i_offset = i
+                break
+        assert i_offset is not None
+        t_offset = times[i_offset]
+        lookup_time = infos[i_offset]['lookup_time']
+        assert abs(lookup_time - t_offset) <= 0.5 * tr.stats.delta
+
+        # new metadata with an epoch boundary exactly between the window
+        # start time and the original lookup time
+        boundary = t_offset + (lookup_time - t_offset) / 2.0
+        inv_v2_old = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V1, gain=60077000.0,
+            sensitivity=2516778400.0, start_date=UTCDateTime("2010-01-01"),
+            end_date=boundary)
+        inv_v2_new = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V2, gain=900000.0, sensitivity=1500000000.0,
+            start_date=boundary)
+        inv_v2 = inv_v2_old + inv_v2_new
+        # sanity check of the test setup: looking up at the window start
+        # time would give the other epoch than looking up at the original
+        # lookup time
+        assert inv_v2.get_channel_epoch(ppsd.id, t_offset) is not \
+            inv_v2.get_channel_epoch(ppsd.id, lookup_time)
+
+        ppsd.recalibrate(inv_v2, "v2", t_offset, t_offset + 1)
+        # the epoch used is the one valid at the original lookup time
+        info = ppsd.get_archive_info(t_offset)
+        expected_epoch = inv_v2.get_channel_epoch(ppsd.id, lookup_time)
+        assert info['epoch_start'] == expected_epoch.start_date
+        assert info['epoch_end'] == expected_epoch.end_date
+        assert info['lookup_time'] == lookup_time
+        # and the values match a fresh computation with the new metadata
+        ppsd_ref = PPSD(tr.stats, inv_v2, ppsd_length=101.0, overlap=0.5)
+        ppsd_ref.add(tr)
+        ref = {t._ns: v for t, v in zip(ppsd_ref.times_processed,
+                                        ppsd_ref.psd_values)}
+        diff = np.abs(np.asarray(ppsd.psd_values[i_offset],
+                                 dtype=np.float64) -
+                      np.asarray(ref[t_offset._ns], dtype=np.float64))
+        assert diff[np.isfinite(diff)].max() <= 1e-4
+
+    def test_recalibrate_different_location(self):
+        """
+        Channels with the same code at different locations must be told
+        apart during recalibration.
+        """
+        tr = _make_ppsd_test_trace(location="00")
+        tr.stats.location = "00"
+        inv_v1 = _make_ppsd_test_inventory(
+            location="00", start_date=UTCDateTime("2010-01-01"))
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        # new metadata has the same channel code at two locations with
+        # different responses
+        inv_v2_loc00 = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V2, gain=900000.0, sensitivity=1500000000.0,
+            location="00", start_date=UTCDateTime("2010-01-01"))
+        inv_v2_loc10 = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V1, gain=1.0, sensitivity=1.0,
+            location="10", start_date=UTCDateTime("2010-01-01"))
+        inv_v2 = inv_v2_loc00 + inv_v2_loc10
+        # strict lookup tells the locations apart
+        assert inv_v2.get_channel_epoch("XX.TEST.00.BHZ", tr.stats.starttime)\
+            is not inv_v2.get_channel_epoch("XX.TEST.10.BHZ",
+                                            tr.stats.starttime)
+        times = ppsd.times_processed
+        ppsd.recalibrate(inv_v2, "v2", times[0], times[1])
+        assert ppsd.get_archive_info(times[0])['channel_id'] == \
+            "XX.TEST.00.BHZ"
+        # values match a fresh computation with the "00" response
+        ppsd_ref = PPSD(tr.stats, inv_v2_loc00, ppsd_length=600.0,
+                        overlap=0.5)
+        ppsd_ref.add(tr)
+        diff = np.abs(np.asarray(ppsd.psd_values[0], dtype=np.float64) -
+                      np.asarray(ppsd_ref.psd_values[0], dtype=np.float64))
+        assert diff[np.isfinite(diff)].max() <= 1e-4
+
+    def test_recalibrate_repeated(self, _archive_ppsd):
+        """
+        Repeated recalibration of the same windows is possible and
+        idempotent for the same metadata.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        times = ppsd.times_processed
+        t_start, t_end = times[2], times[5]
+        ppsd.recalibrate(inv_v2, "v2", t_start, t_end)
+        values_first = [np.array(v) for v in ppsd.psd_values]
+        # recalibrating again with the same metadata changes nothing
+        ppsd.recalibrate(inv_v2, "v2", t_start, t_end)
+        for value, expected in zip(ppsd.psd_values, values_first):
+            np.testing.assert_array_equal(value, expected)
+        # recalibrating with yet another metadata version works, too
+        inv_v3 = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V1, gain=300000.0, sensitivity=900000000.0,
+            start_date=UTCDateTime("2010-01-01"))
+        ppsd.recalibrate(inv_v3, "v3", t_start, t_end)
+        ppsd_ref = PPSD(tr.stats, inv_v3, ppsd_length=600.0, overlap=0.5)
+        ppsd_ref.add(tr)
+        ref = {t._ns: v for t, v in zip(ppsd_ref.times_processed,
+                                        ppsd_ref.psd_values)}
+        for t, value in zip(ppsd.times_processed, ppsd.psd_values):
+            if t_start <= t < t_end:
+                diff = np.abs(np.asarray(value, dtype=np.float64) -
+                              np.asarray(ref[t._ns], dtype=np.float64))
+                assert diff[np.isfinite(diff)].max() <= 1e-4
+                assert ppsd.get_archive_info(t)['version'] == "v3"
+
+    def test_archive_npz_roundtrip(self, _archive_ppsd):
+        """
+        Test saving and loading a PPSD with spectra archive.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        times = ppsd.times_processed
+        ppsd.recalibrate(inv_v2, "v2", times[2], times[5])
+        values_before = [np.array(v) for v in ppsd.psd_values]
+        infos_before = ppsd.get_archive_info()
+
+        with NamedTemporaryFile(suffix=".npz") as tf:
+            filename = tf.name
+            ppsd.save_npz(filename)
+            # the npz file carries the regular keys (readable as a plain
+            # PPSD) plus the archive keys, ppsd_version is unchanged
+            with np.load(filename) as data:
+                for key in PPSD.NPZ_STORE_KEYS:
+                    assert key in data
+                for key in PPSD.NPZ_STORE_KEYS_ARCHIVE:
+                    assert key in data
+                assert data['ppsd_version'].item() == 3
+            ppsd_loaded = PPSD.load_npz(filename, metadata=inv_v2,
+                                        metadata_version="v2")
+
+        assert ppsd_loaded.archive_spectra is True
+        assert ppsd_loaded.metadata_version == "v2"
+        for value, expected in zip(ppsd_loaded.psd_values, values_before):
+            np.testing.assert_array_equal(value, expected)
+        assert ppsd_loaded.get_archive_info() == infos_before
+        # recalibration works on the reloaded object
+        inv_v3 = _make_ppsd_test_inventory(
+            poles=_PPSD_TEST_POLES_V1, gain=300000.0, sensitivity=900000000.0,
+            start_date=UTCDateTime("2010-01-01"))
+        ppsd_loaded.recalibrate(inv_v3, "v3", times[0], times[1])
+        assert ppsd_loaded.get_archive_info(times[0])['version'] == "v3"
+        # adding more data on the reloaded object archives with the version
+        # label given at load time
+        tr2 = _make_ppsd_test_trace(starttime=tr.stats.starttime + 3600,
+                                    seed=43)
+        ppsd_loaded.add(tr2)
+        new_times = [t for t in ppsd_loaded.times_processed
+                     if t >= tr2.stats.starttime]
+        assert len(new_times) > 0
+        for t in new_times:
+            assert ppsd_loaded.get_archive_info(t)['version'] == "v2"
+
+    def test_archive_npz_load_without_metadata_version(self, _archive_ppsd):
+        """
+        Loading an archive npz without a metadata version label is possible
+        (e.g. for plotting), but adding more data requires the label.
+        """
+        tr, inv_v1, _ = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        with NamedTemporaryFile(suffix=".npz") as tf:
+            filename = tf.name
+            ppsd.save_npz(filename)
+            ppsd_loaded = PPSD.load_npz(filename, metadata=inv_v1)
+            assert ppsd_loaded.archive_spectra is True
+            # histogram can be computed without a metadata version
+            ppsd_loaded.calculate_histogram()
+            with pytest.raises(ValueError, match="metadata_version"):
+                ppsd_loaded.add(tr)
+            # setting the label afterwards works
+            ppsd_loaded.metadata_version = "v1"
+            ppsd_loaded.add(_make_ppsd_test_trace(
+                starttime=tr.stats.starttime + 3600, seed=43))
+
+    def test_archive_npz_merge(self, _archive_ppsd):
+        """
+        Test merging npz files with spectra archive information.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        tr2 = _make_ppsd_test_trace(starttime=tr.stats.starttime + 3600,
+                                    seed=43)
+        ppsd1 = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                     archive_spectra=True, metadata_version="v1")
+        ppsd1.add(tr)
+        ppsd2 = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                     archive_spectra=True, metadata_version="v1")
+        ppsd2.add(tr2)
+        # plain PPSD of the first part, for the incompatible-merge checks
+        ppsd_plain = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5)
+        ppsd_plain.add(tr)
+
+        with NamedTemporaryFile(suffix=".npz") as tf1, \
+                NamedTemporaryFile(suffix=".npz") as tf2, \
+                NamedTemporaryFile(suffix=".npz") as tf3:
+            ppsd1.save_npz(tf1.name)
+            ppsd2.save_npz(tf2.name)
+            ppsd_plain.save_npz(tf3.name)
+
+            # merging two archive npz files keeps windows and archive
+            # entries in sync
+            ppsd_merged = PPSD(tr.stats, inv_v1, ppsd_length=600.0,
+                               overlap=0.5, archive_spectra=True,
+                               metadata_version="v1")
+            ppsd_merged.add_npz(tf1.name)
+            ppsd_merged.add_npz(tf2.name)
+            assert len(ppsd_merged.times_processed) == \
+                len(ppsd1.times_processed) + len(ppsd2.times_processed)
+            infos = ppsd_merged.get_archive_info()
+            assert len(infos) == len(ppsd_merged.times_processed)
+            expected = {t._ns: info for t, info in
+                        zip(ppsd1.times_processed, ppsd1.get_archive_info())}
+            expected.update({t._ns: info for t, info in
+                             zip(ppsd2.times_processed,
+                                 ppsd2.get_archive_info())})
+            for t, info in zip(ppsd_merged.times_processed, infos):
+                assert info == expected[t._ns]
+            # merged object can be recalibrated as a whole
+            times = ppsd_merged.times_processed
+            ppsd_merged.recalibrate(inv_v2, "v2", times[0],
+                                    times[-1] + ppsd_merged.ppsd_length)
+            assert {info['version']
+                    for info in ppsd_merged.get_archive_info()} == {"v2"}
+
+            # overlapping windows are skipped together with their archive
+            # entries (existing merge rules)
+            ppsd_overlap = PPSD(tr.stats, inv_v1, ppsd_length=600.0,
+                                overlap=0.5, archive_spectra=True,
+                                metadata_version="v1")
+            ppsd_overlap.add_npz(tf1.name)
+            with pytest.warns(UserWarning, match="segments omitted"):
+                ppsd_overlap.add_npz(tf1.name)
+            assert len(ppsd_overlap.times_processed) == \
+                len(ppsd1.times_processed)
+
+            # an archive PPSD refuses npz files without archive information
+            ppsd_refuse = PPSD(tr.stats, inv_v1, ppsd_length=600.0,
+                               overlap=0.5, archive_spectra=True,
+                               metadata_version="v1")
+            with pytest.raises(ValueError, match="archive"):
+                ppsd_refuse.add_npz(tf3.name)
+
+            # a plain PPSD accepts archive npz files but discards the
+            # archive information (with a warning)
+            ppsd_drop = PPSD(tr.stats, inv_v1, ppsd_length=600.0,
+                             overlap=0.5)
+            with pytest.warns(UserWarning, match="Discarding"):
+                ppsd_drop.add_npz(tf2.name)
+            assert ppsd_drop.archive_spectra is False
+            assert len(ppsd_drop.times_processed) == \
+                len(ppsd2.times_processed)
+
+    def test_plain_npz_still_loads(self, _archive_ppsd):
+        """
+        Plain npz files (as written by ObsPy versions without spectra
+        archiving support) load as before, with archiving switched off.
+        """
+        tr, inv_v1, inv_v2 = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5)
+        ppsd.add(tr)
+        with NamedTemporaryFile(suffix=".npz") as tf:
+            filename = tf.name
+            ppsd.save_npz(filename)
+            with np.load(filename) as data:
+                for key in PPSD.NPZ_STORE_KEYS_ARCHIVE:
+                    assert key not in data
+                assert PPSD.NPZ_ARCHIVE_FORMAT_KEY not in data
+            ppsd_loaded = PPSD.load_npz(filename, metadata=inv_v1)
+        assert ppsd_loaded.archive_spectra is False
+        ppsd_loaded.calculate_histogram()
+        with pytest.raises(PPSDRecalibrationError):
+            ppsd_loaded.recalibrate(inv_v2, "v2",
+                                    ppsd_loaded.times_processed[0],
+                                    ppsd_loaded.times_processed[1])
+
+    def test_get_archive_info(self, _archive_ppsd):
+        """
+        Test querying per-window calibration records.
+        """
+        tr, inv_v1, _ = _archive_ppsd
+        ppsd = PPSD(tr.stats, inv_v1, ppsd_length=600.0, overlap=0.5,
+                    archive_spectra=True, metadata_version="v1")
+        ppsd.add(tr)
+        times = ppsd.times_processed
+        infos = ppsd.get_archive_info()
+        assert len(infos) == len(times)
+        info = ppsd.get_archive_info(times[3])
+        assert info == infos[3]
+        assert info['version'] == "v1"
+        assert info['channel_id'] == "XX.TEST..BHZ"
+        assert info['lookup_time'] == times[3]
+        assert info['epoch_start'] == UTCDateTime("2010-01-01")
+        assert info['epoch_end'] is None
+        with pytest.raises(KeyError):
+            ppsd.get_archive_info(times[0] + 1.5)
