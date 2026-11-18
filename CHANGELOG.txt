@@ -11,6 +11,15 @@ Changes:
    * make sure to use a copy of `DEFAULT_SERVICES` when initializing a client
      instance while skipping service discovery, to avoid accidental changes to
      `DEFAULT_SERVICES` (see #3493)
+   * mass downloader: add an optional backfill mode (`backfill=True` on
+     `MassDownloader.download`) that fills individual request windows across
+     data centers instead of letting the first center claim a whole station.
+     Each window is assigned to the first center that delivers both a MiniSEED
+     waveform passing the normal quality controls and a StationXML response
+     valid for every actual sample time; per-station StationXML files are
+     merged and conflicting responses are rejected. Results, including reused
+     local pairs and missing windows with per-center reasons, are returned in
+     a `BackfillReport`
 
 1.4.1 (doi: 10.5281/zenodo.11093256)
 ====================================

@@ -108,13 +108,17 @@ class MassDownloader(object):
 
         self.providers = tuple(providers)
 
+        # Report of the most recent backfill-mode run (None if backfill
+        # mode has never been enabled).
+        self.backfill_report = None
+
         # Initialize all clients.
         self._initialized_clients = collections.OrderedDict()
         self._initialize_clients()
 
     def download(self, domain, restrictions, mseed_storage,
                  stationxml_storage, download_chunk_size_in_mb=20,
-                 threads_per_client=3, print_report=True):
+                 threads_per_client=3, print_report=True, backfill=False):
         """
         Launch the actual data download.
 
@@ -138,7 +142,68 @@ class MassDownloader(object):
         :param threads_per_client: The number of download threads launched
             per client.
         :type threads_per_client: int
+        :param backfill: Enable the optional backfill mode. In normal mode
+            (the default) a station is claimed by the first data center that
+            offers it and every later data center skips the whole station.
+            In backfill mode the download works on the level of the request
+            windows defined by the ``restrictions`` iterator: each
+            ``NET.STA.LOC.CHA`` window is assigned to the first data center,
+            in provider order, that delivers a MiniSEED waveform passing the
+            normal minimum-length/gap quality controls *and* a StationXML
+            response valid for every actual sample time of that waveform.
+            Already verified windows are removed from the waveform requests
+            of subsequent data centers; other windows of the same station
+            may be backfilled by another data center. Each station keeps a
+            single, merged StationXML file. When enabled, a
+            :class:`~.backfill.BackfillReport` describing every attempted
+            window is returned and additionally stored on
+            :attr:`~.MassDownloader.backfill_report`.
+        :type backfill: bool
+
+        .. rubric:: Example: backfill mode
+
+        .. code-block:: python
+
+            from obspy.clients.fdsn.mass_downloader import (
+                MassDownloader, Restrictions, RectangularDomain)
+            from obspy import UTCDateTime
+
+            domain = RectangularDomain(minlatitude=30, maxlatitude=50,
+                                       minlongitude=5, maxlongitude=35)
+            restrictions = Restrictions(
+                starttime=UTCDateTime(2020, 1, 1),
+                endtime=UTCDateTime(2020, 1, 2),
+                chunklength_in_sec=3600,
+                network="BW", station="RJOB", location="", channel="BH*",
+                reject_channels_with_gaps=True, minimum_length=0.9)
+
+            mdl = MassDownloader(providers=["LMU", "GFZ"])
+            report = mdl.download(
+                domain, restrictions,
+                mseed_storage="waveforms",
+                stationxml_storage="stations",
+                backfill=True)
+            # Windows backfilled from a data center, reused from local
+            # files, or still missing and why.
+            print(report)
         """
+        # Reset the report of any previous run.
+        self.backfill_report = None
+
+        if backfill:
+            from .backfill import BackfillDownloader
+            backfiller = BackfillDownloader(
+                mass_downloader=self, domain=domain,
+                restrictions=restrictions, mseed_storage=mseed_storage,
+                stationxml_storage=stationxml_storage, logger=logger,
+                chunk_size_in_mb=download_chunk_size_in_mb,
+                threads_per_client=threads_per_client)
+            report = backfiller.run()
+            self.backfill_report = report
+            if print_report:
+                logger.info(str(report))
+            return report
+
         # The downloads from each client will be handled separately.
         # Nonetheless collect all in this dictionary.
         client_download_helpers = {}

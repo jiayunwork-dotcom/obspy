@@ -413,6 +413,74 @@ value in agreement with some data centers.
 ...              stationxml_storage=stationxml_storage)  # doctest: +SKIP
 
 
+Backfill Mode (Window-Level Gap Filling)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In the normal mode a data center that returns a station claims the whole
+station for the rest of the run; later data centers skip it entirely even if
+the first center could only serve part of the requested time span. Passing
+``backfill=True`` to
+:meth:`~.mass_downloader.MassDownloader.download` switches to an optional
+window-level mode that is useful when, for example, the first hours of a day
+are held by one data center and the later hours by another.
+
+The request windows are still defined by the
+:class:`~.restrictions.Restrictions` iterator (e.g. one window per
+``chunklength_in_sec``). For each ``NET.STA.LOC.CHA`` window the downloader
+walks the data centers in their configured order and assigns the window to
+the first center that delivers a *verifiable pair* of
+
+1. a MiniSEED waveform passing the normal minimum-length and gap quality
+   controls, and
+2. a StationXML instrument response that is valid, at every actual sample
+   time read back from the waveform, for the full SEED id read back from the
+   MiniSEED.
+
+A window's waveform always comes from a single data center, but other windows
+or channels of the same station may be filled by other centers. Already
+verified windows are removed from the waveform requests of subsequent
+centers; each center's StationXML request only covers the windows its
+waveforms actually delivered, and adjacent windows of the same station and
+channel are combined into one request. Each station keeps a single StationXML
+file: candidate responses are merged in, conflicting responses at already
+accepted sample times are rejected (the already accepted file is kept and the
+new window is offered to the next center), and the file is only replaced once
+all accepted windows of the station still read a valid response from it.
+
+Empty location codes and concrete location codes are handled as distinct
+channels. Pre-existing, verifiable waveform/response pairs on disk are reused
+without any network request; failed or unreadable files simply leave the
+affected window pending for the next data center or the next run. The method
+returns a :class:`~.backfill.BackfillReport` (also attached to the downloader
+as ``backfill_report``) listing every attempted window, the center that
+filled it, the windows reused from local files, and the windows still missing
+together with the per-center failure reasons.
+
+.. code-block:: python
+
+    from obspy.clients.fdsn.mass_downloader import (
+        MassDownloader, Restrictions, RectangularDomain)
+    from obspy import UTCDateTime
+
+    domain = RectangularDomain(minlatitude=30, maxlatitude=50,
+                               minlongitude=5, maxlongitude=35)
+    restrictions = Restrictions(
+        starttime=UTCDateTime(2020, 1, 1),
+        endtime=UTCDateTime(2020, 1, 2),
+        chunklength_in_sec=3600,
+        network="BW", station="RJOB", location="", channel="BH*")
+
+    mdl = MassDownloader(providers=["LMU", "GFZ"])
+    report = mdl.download(
+        domain, restrictions,
+        mseed_storage="waveforms",
+        stationxml_storage="stations",
+        backfill=True)
+    for window in report.missing:
+        print(window.seed_id, window.starttime,
+              dict(window.failure_reasons))
+
+
 How it Works
 ------------
 
@@ -518,10 +586,12 @@ from .mass_downloader import MassDownloader  # NOQA
 from .restrictions import Restrictions  # NOQA
 from .domain import (Domain, RectangularDomain,  # NOQA
                      CircularDomain, GlobalDomain)  # NOQA
+from .backfill import BackfillReport, BACKFILL_STATUS  # NOQA
 
 
 __all__ = ['MassDownloader', 'Restrictions', 'Domain', 'RectangularDomain',
-           'CircularDomain', 'GlobalDomain']
+           'CircularDomain', 'GlobalDomain', 'BackfillReport',
+           'BACKFILL_STATUS']
 
 
 if __name__ == '__main__':

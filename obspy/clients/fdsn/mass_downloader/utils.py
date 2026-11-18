@@ -72,7 +72,8 @@ def download_stationxml(client, client_name, bulk, filename, logger):
     return ((network, station), filename)
 
 
-def download_and_split_mseed_bulk(client, client_name, chunks, logger):
+def download_and_split_mseed_bulk(client, client_name, chunks, logger,
+                                  merge_adjacent=True):
     """
     Downloads the channels of a list of stations in bulk, saves it to a
     temporary folder and splits it at the record level to obtain the final
@@ -89,6 +90,13 @@ def download_and_split_mseed_bulk(client, client_name, chunks, logger):
         Each chunk is a tuple of network, station, location, channel,
         starttime, endtime, and desired filename.
     :param logger: An active logger instance.
+    :param merge_adjacent: If True (the default, and the behavior always used
+        by the normal download path) adjacent bulk requests for the same
+        channel are merged into one continuous request. If False, each
+        chunk is requested separately; this is used by the backfill mode
+        where a data center might only serve part of a longer time span and
+        per-window quality control must be able to attribute the returned
+        records to the requested windows.
     """
     # Create a dictionary of channel ids, each containing a list of
     # intervals, each of which will end up in a separate file.
@@ -196,25 +204,26 @@ def download_and_split_mseed_bulk(client, client_name, chunks, logger):
     # other parts and puts less strain on the data centers' FDSN
     # implementation. It furthermore avoid the repeated download of records
     # that are part of two neighbouring time intervals.
-    bulk_channels = collections.defaultdict(list)
-    for b in bulk:
-        bulk_channels[(b[0], b[1], b[2], b[3])].append(b)
+    if merge_adjacent:
+        bulk_channels = collections.defaultdict(list)
+        for b in bulk:
+            bulk_channels[(b[0], b[1], b[2], b[3])].append(b)
 
-    # Merge them.
-    for key, value in bulk_channels.items():
-        # Sort based on starttime.
-        value = sorted(value, key=lambda x: x[4])
-        # Merge adjacent.
-        cur_bulk = value[0:1]
-        for b in value[1:]:
-            # Random threshold of 2 seconds. Reasonable for most real world
-            # cases.
-            if b[4] <= cur_bulk[-1][5] + 2:
-                cur_bulk[-1][5] = b[5]
-                continue
-            cur_bulk.append(b)
-        bulk_channels[key] = cur_bulk
-    bulk = list(itertools.chain.from_iterable(bulk_channels.values()))
+        # Merge them.
+        for key, value in bulk_channels.items():
+            # Sort based on starttime.
+            value = sorted(value, key=lambda x: x[4])
+            # Merge adjacent.
+            cur_bulk = value[0:1]
+            for b in value[1:]:
+                # Random threshold of 2 seconds. Reasonable for most real
+                # world cases.
+                if b[4] <= cur_bulk[-1][5] + 2:
+                    cur_bulk[-1][5] = b[5]
+                    continue
+                cur_bulk.append(b)
+            bulk_channels[key] = cur_bulk
+        bulk = list(itertools.chain.from_iterable(bulk_channels.values()))
 
     # Save first to a temporary file, then cut the file into separate files.
     with NamedTemporaryFile() as tf:
