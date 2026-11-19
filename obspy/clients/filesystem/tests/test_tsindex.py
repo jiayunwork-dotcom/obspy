@@ -2,9 +2,11 @@
 import os
 import re
 import requests
+import shutil
 import tempfile
 import uuid
 from collections import namedtuple
+from io import BytesIO
 from pathlib import Path
 from unittest import mock
 
@@ -12,7 +14,9 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
-from obspy import read, UTCDateTime
+from obspy import read, UTCDateTime, Stream
+from obspy.clients.filesystem import miniseed as miniseed_module
+from obspy.clients.filesystem.msriterator import _MSRIterator
 from obspy.core.util.misc import TemporaryWorkingDirectory
 from obspy.clients.filesystem.tsindex import Client, Indexer, \
     TSIndexDatabaseHandler
@@ -547,6 +551,320 @@ class TestClient():
                                endtime=UTCDateTime(2018, 1, 7))
         assert not client.has_data(starttime=UTCDateTime(1970, 12, 31),
                                    endtime=UTCDateTime(2013, 1, 7))
+
+
+def _record_level_ground_truth(filepath, requests):
+    """
+    Independent ground truth: every request window is served by iterating the
+    physical records of the matching file(s) and trimming each intersecting
+    record directly, without going through the TSIndex client.  Returns a
+    Stream containing one trace per (request, intersecting record).
+    """
+    files = {
+        ("IU", "ANMO", "10", "BHZ"):
+            filepath / 'IU' / '2018' / '001' /
+            'IU.ANMO.10.BHZ.2018.001_first_minute.mseed',
+        ("IU", "COLA", "10", "BHZ"):
+            filepath / 'IU' / '2018' / '001' /
+            'IU.COLA.10.BHZ.2018.001_first_minute.mseed',
+        ("CU", "TGUH", "00", "BHZ"):
+            filepath / 'CU' / '2018' / '001' /
+            'CU.TGUH.00.BHZ.2018.001_first_minute.mseed',
+    }
+    import fnmatch
+    truth = Stream()
+    for net, sta, loc, cha, t1, t2 in requests:
+        for nslc, path in files.items():
+            if not all(fnmatch.fnmatchcase(v, p)
+                       for v, p in zip(nslc, (net, sta, loc, cha))):
+                continue
+            for msri in _MSRIterator(filename=str(path), dataflag=False):
+                if msri.get_endtime() <= t1 or msri.get_starttime() >= t2:
+                    continue
+                import ctypes
+                raw = ctypes.string_at(msri.msr.contents.record,
+                                       msri.msr.contents.reclen)
+                tr = read(BytesIO(raw), format="MSEED")[0]
+                tr.trim(t1, t2)
+                if tr.stats.npts:
+                    truth.append(tr)
+    return truth
+
+
+def _trace_fingerprint(tr):
+    return (tr.id, str(tr.stats.starttime), str(tr.stats.endtime),
+            tuple(tr.data))
+
+
+def _streams_match_recordwise(stream, truth):
+    """Compare two streams at physical-record granularity as multisets."""
+    from collections import Counter
+    got = Counter(_trace_fingerprint(tr) for tr in stream)
+    want = Counter(_trace_fingerprint(tr) for tr in truth)
+    return got == want
+
+
+def _make_bulk_client(tmp_path, filepath, build_summary):
+    """Copy the shipped index into a writable working copy."""
+    db_path = tmp_path / ('with_summary.sqlite' if build_summary
+                          else 'plain.sqlite')
+    shutil.copy(str(filepath / 'timeseries.sqlite'), str(db_path))
+    if build_summary:
+        TSIndexDatabaseHandler(str(db_path)).build_tsindex_summary()
+    return Client(str(db_path),
+                  datapath_replace=("^", str(filepath) + '/'))
+
+
+class TestBulkWaveforms():
+    """Regression tests for the bulk reading entry point."""
+
+    @pytest.fixture(params=[False, True],
+                    ids=["no-summary", "summary"])
+    def bulk_client(self, request, tmp_path, filepath):
+        return _make_bulk_client(tmp_path, filepath, request.param)
+
+    def test_bulk_no_cross_channel_leakage(self, bulk_client):
+        # the original report: each station must only see its own window
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [
+            ("IU", "ANM?", "10", "BHZ", t0 + 1, t0 + 4),
+            ("CU", "TGUH", "00", "BHZ", t0 + 9, t0 + 12),
+        ]
+        st = bulk_client.get_waveforms_bulk(requests, merge=None)
+        truth = _record_level_ground_truth(
+            Path(bulk_client.data_extractor.dp_replace_sub), requests)
+        assert _streams_match_recordwise(st, truth)
+        assert len(st) == 2
+        ids = sorted(tr.id for tr in st)
+        assert ids == ["CU.TGUH.00.BHZ", "IU.ANMO.10.BHZ"]
+        sample_period = 1.0 / 40
+        for tr in st:
+            if tr.id == "IU.ANMO.10.BHZ":
+                win_start, win_end = t0 + 1, t0 + 4
+            else:
+                win_start, win_end = t0 + 9, t0 + 12
+            # trace ends may shift by at most one sample due to grid alignment
+            assert tr.stats.starttime >= win_start - sample_period
+            assert tr.stats.endtime <= win_end + sample_period
+
+    def test_bulk_two_windows_same_channel_unmerged(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [
+            ("IU", "ANMO", "10", "BHZ", t0 + 5, t0 + 8),
+            ("IU", "ANMO", "10", "BHZ", t0 + 20, t0 + 23),
+        ]
+        st = bulk_client.get_waveforms_bulk(requests, merge=None)
+        truth = _record_level_ground_truth(
+            Path(bulk_client.data_extractor.dp_replace_sub), requests)
+        assert _streams_match_recordwise(st, truth)
+        # both windows remain visible when merging is switched off
+        starts = {str(tr.stats.starttime) for tr in st}
+        assert len(st) >= 2
+        assert all(any(s in x for x in starts) for s in starts)
+
+    def test_bulk_overlapping_windows(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [
+            ("IU", "ANMO", "10", "BHZ", t0 + 10, t0 + 13),
+            ("IU", "ANMO", "10", "BHZ", t0 + 12, t0 + 15),
+        ]
+        datapath = Path(bulk_client.data_extractor.dp_replace_sub)
+        st = bulk_client.get_waveforms_bulk(requests, merge=None)
+        truth = _record_level_ground_truth(datapath, requests)
+        assert _streams_match_recordwise(st, truth)
+        # overlap samples occur in both unmerged traces
+        assert len(st) == 2
+        # default merge joins the two windows into one
+        merged = bulk_client.get_waveforms_bulk(requests, merge=-1)
+        assert len(merged) == 1
+        single = read(datapath / 'IU' / '2018' / '001' /
+                      'IU.ANMO.10.BHZ.2018.001_first_minute.mseed',
+                      starttime=t0 + 10, endtime=t0 + 15)
+        assert list(merged[0].data) == list(single[0].data)
+
+    def test_bulk_reordered_and_empty_windows(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [
+            ("IU", "ANMO", "10", "BHZ", t0 + 30, t0 + 32),
+            ("XX", "NOPE", "00", "BHZ", t0 + 2, t0 + 3),
+            ("CU", "TGUH", "00", "BHZ", t0 + 40, t0 + 43),
+            ("ZZ", "VOID", "", "BH?", t0 + 2, t0 + 3),
+            ("IU", "COL?", "10", "BHZ", t0 + 50, t0 + 52),
+        ]
+        st = bulk_client.get_waveforms_bulk(requests, merge=None)
+        truth = _record_level_ground_truth(
+            Path(bulk_client.data_extractor.dp_replace_sub), requests)
+        assert _streams_match_recordwise(st, truth)
+        assert len(st) == 3
+
+    def test_bulk_duplicated_request(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [
+            ("IU", "ANMO", "10", "BHZ", t0 + 5, t0 + 7),
+            ("IU", "ANMO", "10", "BHZ", t0 + 5, t0 + 7),
+        ]
+        st = bulk_client.get_waveforms_bulk(requests, merge=None)
+        truth = _record_level_ground_truth(
+            Path(bulk_client.data_extractor.dp_replace_sub), requests)
+        assert _streams_match_recordwise(st, truth)
+        # merging reproduces the small-batch single request result
+        merged = bulk_client.get_waveforms_bulk(requests, merge=-1)
+        single = bulk_client.get_waveforms(
+            "IU", "ANMO", "10", "BHZ", t0 + 5, t0 + 7)
+        assert len(merged) == len(single)
+        for a, b in zip(merged.sort(), single.sort()):
+            assert list(a.data) == list(b.data)
+
+    def test_bulk_does_not_mutate_input(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [
+            ("IU", "ANMO", "10", "BHZ", t0 + 1, t0 + 2),
+        ]
+        original = list(requests[0])
+        bulk_client.get_waveforms_bulk(requests)
+        assert list(requests[0]) == original
+        assert isinstance(requests[0][4], UTCDateTime)
+
+    def test_bulk_more_than_500_explicit_requests(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        rows = [("XX", "ST%03d" % i, "00", "BHZ", t0, t0 + 1)
+                for i in range(501)]
+        # valid request placed at the very end must not be lost
+        rows.append(("IU", "ANMO", "10", "BHZ", t0 + 1, t0 + 4))
+        st = bulk_client.get_waveforms_bulk(rows)
+        assert len(st) == 1
+        assert st[0].id == "IU.ANMO.10.BHZ"
+
+    def test_bulk_comma_selector_expands_past_limit(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        stations = ",".join("X%03d" % i for i in range(170))
+        rows = [("XX", stations, "00", "BH?,BHN,BHE", t0, t0 + 1),
+                ("CU", "TGUH", "00", "BHZ", t0 + 9, t0 + 12)]
+        st = bulk_client.get_waveforms_bulk(rows)
+        assert len(st) == 1
+        assert st[0].id == "CU.TGUH.00.BHZ"
+
+    def test_bulk_uses_chunked_index_queries(self, bulk_client):
+        t0 = UTCDateTime(2018, 1, 1)
+        sparse = [("XX", "ST%04d" % i, "00", "BHZ", t0, t0 + 1)
+                  for i in range(1000)]
+        sparse += [
+            ("IU", "ANMO", "10", "BHZ", t0 + 1, t0 + 2),
+            ("CU", "TGUH", "00", "BHZ", t0 + 3, t0 + 4),
+        ]
+        engine = bulk_client.request_handler.engine
+        selects = {"n": 0}
+
+        def hook(conn, cursor, statement, parameters, context,
+                 executemany):
+            if "from tsindex" in " ".join(statement.lower().split()):
+                selects["n"] += 1
+
+        sa.event.listen(engine, "after_cursor_execute", hook)
+        try:
+            st = bulk_client.get_waveforms_bulk(sparse)
+        finally:
+            sa.event.remove(engine, "after_cursor_execute", hook)
+        assert len(st) == 2
+        # 1002 requests split into three chunks, not one query per request
+        assert selects["n"] == 3
+
+    def test_bulk_shares_single_record_read_and_decode(
+            self, bulk_client, monkeypatch):
+        # 64 windows all intersecting the first ANMO physical record
+        t0 = UTCDateTime(2018, 1, 1)
+        windows = [("IU", "ANMO", "10", "BHZ",
+                    t0 + 0.1 + i * 0.08, t0 + 0.15 + i * 0.08)
+                   for i in range(64)]
+        extractor = bulk_client.data_extractor
+
+        # independent counters at the file-iterator and decode boundaries
+        real_iterator = miniseed_module._MSRIterator
+        opens = {"n": 0}
+
+        class CountingIterator(real_iterator):
+            def __init__(self, filename, *args, **kwargs):
+                if "ANMO.10.BHZ" in filename:
+                    opens["n"] += 1
+                super().__init__(filename, *args, **kwargs)
+
+        real_read = miniseed_module.read
+        decodes = {"n": 0}
+
+        def counting_read(*args, **kwargs):
+            decodes["n"] += 1
+            return real_read(*args, **kwargs)
+
+        monkeypatch.setattr(miniseed_module, "_MSRIterator", CountingIterator)
+        monkeypatch.setattr(miniseed_module, "read", counting_read)
+
+        st = bulk_client.get_waveforms_bulk(windows, merge=None)
+        truth = _record_level_ground_truth(
+            Path(bulk_client.data_extractor.dp_replace_sub), windows)
+        assert _streams_match_recordwise(st, truth)
+        assert len(st) == 64
+        # one traversal, one decode of the shared physical record
+        assert extractor.num_file_reads == 1
+        assert opens["n"] == 1
+        assert extractor.num_record_decodes == 1
+        assert decodes["n"] == 1
+
+    def test_bulk_skips_unrelated_records(self, bulk_client, monkeypatch):
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [("IU", "ANMO", "10", "BHZ", t0 + 1, t0 + 1.5)]
+        real_read = miniseed_module.read
+        decodes = {"n": 0}
+
+        def counting_read(*args, **kwargs):
+            decodes["n"] += 1
+            return real_read(*args, **kwargs)
+
+        monkeypatch.setattr(miniseed_module, "read", counting_read)
+        st = bulk_client.get_waveforms_bulk(requests, merge=None)
+        truth = _record_level_ground_truth(
+            Path(bulk_client.data_extractor.dp_replace_sub), requests)
+        assert _streams_match_recordwise(st, truth)
+        # only the single intersecting record is decoded
+        assert decodes["n"] == 1
+
+    def test_bulk_full_section_uses_direct_file_read(
+            self, bulk_client, monkeypatch):
+        requests = [("IU", "ANMO", "10", "BHZ",
+                     UTCDateTime(2018, 1, 1, 0, 0, 0, 19500),
+                     UTCDateTime(2018, 1, 1, 0, 0, 59, 994536))]
+        # a full section is served via _FileDataSegment without any record
+        # level decoding in the extractor
+        extractor = bulk_client.data_extractor
+        st = bulk_client.get_waveforms_bulk(requests, merge=None)
+        assert extractor.num_record_decodes == 0
+        datapath = Path(bulk_client.data_extractor.dp_replace_sub)
+        truth = read(datapath / 'IU' / '2018' / '001' /
+                     'IU.ANMO.10.BHZ.2018.001_first_minute.mseed',
+                     starttime=requests[0][4], endtime=requests[0][5])
+        assert len(st) == len(truth)
+        for a, b in zip(st.sort(), truth.sort()):
+            assert list(a.data) == list(b.data)
+
+    def test_bulk_datapath_replacement(self, tmp_path, filepath):
+        # simulate an archive that moved after indexing
+        moved = tmp_path / "moved_archive"
+        shutil.copytree(str(filepath), str(moved),
+                        ignore=shutil.ignore_patterns("*.sqlite"))
+        db_path = tmp_path / "moved.sqlite"
+        shutil.copy(str(filepath / 'timeseries.sqlite'), str(db_path))
+        client = Client(str(db_path),
+                        datapath_replace=("^", str(moved) + '/'))
+        t0 = UTCDateTime(2018, 1, 1)
+        requests = [
+            ("IU", "ANM?", "10", "BHZ", t0 + 2, t0 + 5),
+            ("CU", "TGUH", "00", "BHZ", t0 + 6, t0 + 9),
+        ]
+        st = client.get_waveforms_bulk(requests)
+        truth = _record_level_ground_truth(moved, requests).merge(-1)
+        got = st.copy().merge(-1)
+        assert len(got) == len(truth)
+        for a, b in zip(got.sort(), truth.sort()):
+            assert list(a.data) == list(b.data)
 
 
 def purge(dir, pattern):

@@ -153,6 +153,32 @@ class _FileDataSegment(_ExtractedDataSegment):
         return self.src_name
 
 
+class _StreamDataSegment(_ExtractedDataSegment):
+    """
+    Segment of data that has already been decoded into a
+    :class:`~obspy.core.stream.Stream`
+    """
+    def __init__(self, stream, num_bytes, src_name):
+        """
+        :param stream: A :class:`~obspy.core.stream.Stream` holding the
+            (already trimmed) data for one request / record combination
+        :param num_bytes: Number of source bytes the data came from
+        :param src_name: Name of the data source for logging
+        """
+        self.stream = stream
+        self.num_bytes = num_bytes
+        self.src_name = src_name
+
+    def read_stream(self):
+        return self.stream
+
+    def get_num_bytes(self):
+        return self.num_bytes
+
+    def get_src_name(self):
+        return self.src_name
+
+
 class _MiniseedDataExtractor(object):
     """
     Component for extracting, trimming, and validating data.
@@ -173,6 +199,11 @@ class _MiniseedDataExtractor(object):
             self.dp_replace_re = None
             self.dp_replace_sub = None
         self.request_limit = request_limit
+        # Counters useful for verifying that record level reads and decodes
+        # are shared between requests.  They are reset at the start of every
+        # extract_data() call.
+        self.num_file_reads = 0
+        self.num_record_decodes = 0
 
     def handle_trimming(self, stime, etime, nrow):
         """
@@ -211,17 +242,64 @@ class _MiniseedDataExtractor(object):
             return ([row_stime.timestamp, block_start, False],
                     [row_etime.timestamp, block_end, False])
 
+    @staticmethod
+    def _merge_byte_ranges(byte_ranges):
+        """
+        Merge a list of ``(start_offset, end_offset)`` byte ranges into the
+        smallest set of non-overlapping, contiguous ranges.
+        """
+        merged = []
+        for off_start, off_end in sorted(byte_ranges):
+            if not merged or off_start > merged[-1][1]:
+                merged.append([off_start, off_end])
+            else:
+                merged[-1][1] = max(merged[-1][1], off_end)
+        return [(start, end) for start, end in merged]
+
+    def _resolve_filename(self, filename):
+        """
+        Apply the configured data path replacement to an indexed filename and
+        make sure the resulting file exists.
+        """
+        filename = os.path.normpath(filename).replace("\\", "/")
+        if self.dp_replace_re and self.dp_replace_sub:
+            filename = self.dp_replace_re.sub(
+                self.dp_replace_sub.replace("\\", "/"), filename)
+        filename = os.path.normpath(filename)
+        if not os.path.exists(filename):
+            raise Exception("Data file does not exist: %s" % filename)
+        return filename
+
+    def _decode_record(self, msri):
+        """
+        Decode the miniSEED record currently held by an `_MSRIterator`
+        exactly once and return the resulting
+        :class:`~obspy.core.stream.Stream`.
+        """
+        self.num_record_decodes += 1
+        reclen = msri.msr.contents.reclen
+        return read(BytesIO(ctypes.string_at(
+            msri.msr.contents.record, reclen)), format="MSEED")
+
     def extract_data(self, index_rows):
         """
         Perform the data extraction.
+
+        Requests are grouped by the physical file they live in.  Every file
+        is traversed at most once over the union of all requested byte
+        ranges, and each miniSEED record that intersects a request window is
+        read and decoded a single time; the decoded trace is trimmed once per
+        request that needs it.
 
         :param index_rows: requested data, as produced by
         `HTTPServer_RequestHandler.fetch_index_rows`
         :yields: sequence of `_ExtractedDataSegment`s
         """
+        self.num_file_reads = 0
+        self.num_record_decodes = 0
 
         # Pre-scan the index rows:
-        # 1) Build processed list for extraction
+        # 1) Build processed list for extraction, grouped per physical file
         # 2) Check if the request is small enough to satisfy
         # Note: accumulated estimate of output bytes will be equal to or
         # higher than actual output
@@ -245,13 +323,7 @@ class _MiniseedDataExtractor(object):
                     raise RequestLimitExceededError(
                             "Result exceeds limit of %d bytes" %
                             self.request_limit)
-                filename = os.path.normpath(filename).replace("\\", "/")
-                if self.dp_replace_re and self.dp_replace_sub:
-                    filename = self.dp_replace_re.sub(
-                        self.dp_replace_sub.replace("\\", "/"), filename)
-                filename = os.path.normpath(filename)
-                if not os.path.exists(filename):
-                    raise Exception("Data file does not exist: %s" % filename)
+                filename = self._resolve_filename(filename)
                 request_rows.append(Request(srcname=srcname,
                                             filename=filename,
                                             starttime=starttime,
@@ -268,41 +340,85 @@ class _MiniseedDataExtractor(object):
         if total_bytes == 0:
             raise NoDataError()
 
-        # Get & return the actual data
+        # Group the requests by physical file.  Only data of the file that is
+        # currently processed is kept in memory, decoded records are released
+        # again as soon as the next file is handled.
+        file_groups = {}
         for nrow in request_rows:
-            logger.debug("Extracting %s (%s - %s) from %s" % (nrow.srcname,
-                                                              nrow.starttime,
-                                                              nrow.endtime,
-                                                              nrow.filename))
+            group = file_groups.setdefault(nrow.filename, [])
+            group.append(nrow)
 
-            # Iterate through records in section
-            # if only part of the section is needed
-            if nrow.triminfo[0][2] or nrow.triminfo[1][2]:
+        for filename, file_requests in file_groups.items():
+            full_reads = [r for r in file_requests
+                          if not (r.triminfo[0][2] or r.triminfo[1][2])]
+            trim_reads = [r for r in file_requests
+                          if r.triminfo[0][2] or r.triminfo[1][2]]
 
-                for msri in _MSRIterator(filename=nrow.filename,
-                                         startoffset=nrow.triminfo[0][1],
+            # Requests covering an entire indexed section can be served
+            # directly from the file without record level iteration.
+            for nrow in full_reads:
+                logger.debug("Extracting %s (%s - %s) from %s"
+                             % (nrow.srcname, nrow.starttime, nrow.endtime,
+                                nrow.filename))
+                self.num_file_reads += 1
+                yield _FileDataSegment(nrow.filename,
+                                       nrow.triminfo[0][1], nrow.bytes,
+                                       nrow.srcname)
+
+            if not trim_reads:
+                continue
+
+            # Merge the byte ranges that need record level inspection so the
+            # file is traversed once even when many windows share records.
+            byte_ranges = [(r.triminfo[0][1], r.triminfo[1][1])
+                           for r in trim_reads]
+            for range_start, range_end in self._merge_byte_ranges(byte_ranges):
+                logger.debug("Scanning %s bytes %d-%d for %d requests"
+                             % (filename, range_start, range_end,
+                                len(trim_reads)))
+                self.num_file_reads += 1
+                # Cache of decoded records for this byte range only, keyed by
+                # file offset.  Several windows hitting the same record share
+                # the single decoded trace.
+                decoded_records = {}
+                for msri in _MSRIterator(filename=filename,
+                                         startoffset=range_start,
                                          dataflag=False):
                     offset = msri.get_offset()
 
-                    # Done if we are beyond end offset
-                    if offset >= nrow.triminfo[1][1]:
+                    # Done if we are beyond the end of the merged range
+                    if offset >= range_end:
                         break
 
-                    yield _MSRIDataSegment(msri,
-                                           nrow.samplerate,
-                                           nrow.starttime,
-                                           nrow.endtime,
-                                           nrow.srcname)
+                    reclen = msri.msr.contents.reclen
+                    record_end = offset + reclen
+                    record_start = msri.get_starttime()
+                    record_endtime = msri.get_endtime()
 
-                    # Check for passing end offset
-                    if (offset + msri.msr.contents.reclen) >= \
-                            nrow.triminfo[1][1]:
+                    for nrow in trim_reads:
+                        # Only requests whose trimmed byte span covers this
+                        # record can contain data for it
+                        if offset < nrow.triminfo[0][1] or \
+                                offset >= nrow.triminfo[1][1]:
+                            continue
+                        # Skip records outside the request time window
+                        if record_endtime <= nrow.starttime or \
+                                record_start >= nrow.endtime:
+                            continue
+
+                        if offset not in decoded_records:
+                            decoded_records[offset] = self._decode_record(msri)
+                        decoded_st = decoded_records[offset]
+                        tr = decoded_st[0].copy()
+                        tr.trim(nrow.starttime, nrow.endtime)
+                        if tr.stats.npts == 0:
+                            continue
+                        yield _StreamDataSegment(
+                            Stream(traces=[tr]), reclen, nrow.srcname)
+
+                    # Check for passing the end of the merged range
+                    if record_end >= range_end:
                         break
-
-            # Otherwise, return the entire section
-            else:
-                yield _FileDataSegment(nrow.filename, nrow.triminfo[0][1],
-                                       nrow.bytes, nrow.srcname)
 
 
 if __name__ == '__main__':

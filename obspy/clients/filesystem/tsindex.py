@@ -1509,6 +1509,64 @@ class TSIndexDatabaseHandler(object):
         else:
             return False
 
+    # SQLite rejects a compound SELECT (the UNION ALL used to build the
+    # request CTE) containing more than 500 terms.  Keep the per-query chunk
+    # size comfortably below that limit.
+    _MAX_SQL_TERMS = 450
+
+    def _build_request_cte(self, session, query_rows, cte_name):
+        """
+        Build a CTE holding the (cleaned) request rows.
+
+        Every request is assigned a stable ``requestid`` so that the index
+        rows matched in the join can be tied back to the request they
+        actually belong to.  Without that correlation a bulk request joining
+        several channels against the request CTE produces a cartesian
+        product and each channel gets returned once per request window.
+
+        The request rows are split into chunks so that the generated
+        ``UNION ALL`` compound SELECT never exceeds SQLite's limit of 500
+        terms, regardless of how many requests (including requests expanded
+        from comma separated selectors) are submitted at once.
+
+        :type query_rows: list(tuple)
+        :param query_rows: cleaned request rows
+        :type cte_name: str
+        :param cte_name: name to give the CTE
+        :rtype: :class:`sqlalchemy.sql.expression.CTE`
+        """
+        stmts = []
+        for requestid, (a, b, c, d, e, f) in enumerate(query_rows):
+            starttime = ('0000-00-00T00:00:00' if e == '*' else e)
+            endtime = ('5000-00-00T00:00:00' if f == '*' else f)
+            stmts.append(sa.select([
+                sa.literal(requestid).label("requestid"),
+                sa.literal(a).label("network"),
+                sa.literal(b).label("station"),
+                sa.literal(c).label("location"),
+                sa.literal(d).label("channel"),
+                sa.literal(starttime).label("starttime"),
+                sa.literal(endtime).label("endtime"),
+            ]))
+        # Combine the per-chunk compound selects through plain subqueries so
+        # that none of the individual UNION ALL statements exceeds SQLite's
+        # 500 term limit, no matter how large the full request set is.
+        chunk_subqueries = []
+        for start in range(0, len(stmts), self._MAX_SQL_TERMS):
+            chunk = sa.union_all(*stmts[start:start + self._MAX_SQL_TERMS])
+            chunk_subqueries.append(chunk.alias("request_chunk"))
+        combined = sa.union_all(*[sa.select([sq])
+                                  for sq in chunk_subqueries])
+        return combined.cte(name=cte_name)
+
+    @staticmethod
+    def _query_contains_wildcards(query_rows):
+        for req in query_rows:
+            for field in req[:4]:
+                if '*' in str(field) or '?' in str(field):
+                    return True
+        return False
+
     def _fetch_index_rows(self, query_rows=None, bulk_params=None):
         '''
         Fetch index rows matching specified request. This method is marked as
@@ -1539,162 +1597,136 @@ class TSIndexDatabaseHandler(object):
             bulk_params = {}
 
         query_rows = self._clean_query_rows(query_rows)
-        request_cte_name = "raw_request_cte"
-
-        result = []
-        # Create a CTE that contains the request
-        try:
-            stmts = [
-                sa.select([
-                    sa.literal(a).label("network"),
-                    sa.literal(b).label("station"),
-                    sa.literal(c).label("location"),
-                    sa.literal(d).label("channel"),
-                    sa.literal(e).label("starttime")
-                    if e != '*' else
-                    sa.literal('0000-00-00T00:00:00').label("starttime"),
-                    sa.literal(f).label("endtime")
-                    if f != '*' else
-                    sa.literal('5000-00-00T00:00:00').label("endtime")
-                ])
-                for idx, (a, b, c, d, e, f) in enumerate(query_rows)
-            ]
-            requests = sa.union_all(*stmts)
-            requests_cte = requests.cte(name=request_cte_name)
-            wildcards = False
-            for req in query_rows:
-                for field in req:
-                    if '*' in str(field) or '?' in str(field):
-                        wildcards = True
-                        break
-            summary_present = self.has_tsindex_summary()
-            if wildcards and summary_present:
-                # Resolve wildcards using summary if present to:
-                # a) resolve wildcards, allows use of '=' operator
-                #    and table index
-                # b) reduce index table search to channels that are
-                #    known included
-                flattened_request_cte_name = 'flattened_request_cte'
-                # expand
-                flattened_request_cte = (
-                    session
-                    .query(self.TSIndexSummaryTable.network,
-                           self.TSIndexSummaryTable.station,
-                           self.TSIndexSummaryTable.location,
-                           self.TSIndexSummaryTable.channel,
-                           self.TSIndexSummaryTable.network,
-                           sa.case([
-                                    (requests_cte.c.starttime == '*',
-                                     self.TSIndexSummaryTable.earliest),
-                                    (requests_cte.c.starttime != '*',
-                                     requests_cte.c.starttime)
-                                   ])
-                           .label('starttime'),
-                           sa.case([
-                                    (requests_cte.c.endtime == '*',
-                                     self.TSIndexSummaryTable.latest),
-                                    (requests_cte.c.endtime != '*',
-                                     requests_cte.c.endtime)
-                                   ])
-                           .label('endtime'))
-                    .filter(self.TSIndexSummaryTable.network.op('GLOB')
-                            (requests_cte.c.network))
-                    .filter(self.TSIndexSummaryTable.station.op('GLOB')
-                            (requests_cte.c.station))
-                    .filter(self.TSIndexSummaryTable.location.op('GLOB')
-                            (requests_cte.c.location))
-                    .filter(self.TSIndexSummaryTable.channel.op('GLOB')
-                            (requests_cte.c.channel))
-                    .filter(self.TSIndexSummaryTable.earliest <=
-                            requests_cte.c.endtime)
-                    .filter(self.TSIndexSummaryTable.latest >=
-                            requests_cte.c.starttime)
-                    .order_by(self.TSIndexSummaryTable.network,
-                              self.TSIndexSummaryTable.station,
-                              self.TSIndexSummaryTable.location,
-                              self.TSIndexSummaryTable.channel,
-                              self.TSIndexSummaryTable.earliest,
-                              self.TSIndexSummaryTable.latest)
-                    .cte(name=flattened_request_cte_name))
-                result = (
-                    session
-                    .query(self.TSIndexTable,
-                           requests_cte.c.starttime,
-                           requests_cte.c.endtime)
-                    .filter(self.TSIndexTable.network ==
-                            flattened_request_cte.c.network)
-                    .filter(self.TSIndexTable.station ==
-                            flattened_request_cte.c.station)
-                    .filter(self.TSIndexTable.location ==
-                            flattened_request_cte.c.location)
-                    .filter(self.TSIndexTable.channel ==
-                            flattened_request_cte.c.channel)
-                    .filter(self.TSIndexTable.starttime <=
-                            flattened_request_cte.c.endtime)
-                    .filter(self.TSIndexTable.endtime >=
-                            flattened_request_cte.c.starttime)
-                    .order_by(self.TSIndexTable.network,
-                              self.TSIndexTable.station,
-                              self.TSIndexTable.location,
-                              self.TSIndexTable.channel,
-                              self.TSIndexTable.starttime,
-                              self.TSIndexTable.endtime))
-                wildcards = False
-            else:
-                result = (
-                    session
-                    .query(self.TSIndexTable,
-                           requests_cte.c.starttime,
-                           requests_cte.c.endtime
-                           )
-                    .filter(self.TSIndexTable.network.op('GLOB')
-                            (requests_cte.c.network))
-                    .filter(self.TSIndexTable.station.op('GLOB')
-                            (requests_cte.c.station))
-                    .filter(self.TSIndexTable.location.op('GLOB')
-                            (requests_cte.c.location))
-                    .filter(self.TSIndexTable.channel.op('GLOB')
-                            (requests_cte.c.channel))
-                    .filter(self.TSIndexTable.starttime <=
-                            requests_cte.c.endtime)
-                    .filter(self.TSIndexTable.endtime >=
-                            requests_cte.c.starttime)
-                    .order_by(self.TSIndexTable.network,
-                              self.TSIndexTable.station,
-                              self.TSIndexTable.location,
-                              self.TSIndexTable.channel,
-                              self.TSIndexTable.starttime,
-                              self.TSIndexTable.endtime))
-        except Exception as err:
-            raise ValueError(str(err))
+        wildcards = self._query_contains_wildcards(query_rows)
+        summary_present = self.has_tsindex_summary()
 
         index_rows = []
-        try:
-            for rt in result:
-                # convert to a named tuple
-                NamedRow = namedtuple('NamedRow',
-                                      ['network', 'station', 'location',
-                                       'channel', 'quality', 'version',
-                                       'starttime', 'endtime', 'samplerate',
-                                       'filename', 'byteoffset', 'bytes',
-                                       'hash', 'timeindex', 'timespans',
-                                       'timerates', 'format', 'filemodtime',
-                                       'updated', 'scanned', 'requeststart',
-                                       'requestend'])
-                row, requeststart, requestend = rt
-                nrow = NamedRow(
-                        row.network, row.station, row.location,
-                        row.channel, row.quality, row.version,
-                        row.starttime, row.endtime, row.samplerate,
-                        row.filename, row.byteoffset, row.bytes,
-                        row.hash, row.timeindex, row.timespans,
-                        row.timerates, row.format, row.filemodtime,
-                        row.updated, row.scanned,
-                        requeststart, requestend
-                       )
-                index_rows.append(nrow)
-        except ResourceClosedError:
-            pass  # query returned no results
+        # The requestid is carried in every result row so that identical
+        # requests are not collapsed by the ORM identity map and so each
+        # matched index row can be tied back to the request it belongs to.
+        # It is appended at the end to keep the leading NSLC field layout
+        # unchanged for downstream consumers.
+        NamedRow = namedtuple('NamedRow',
+                              ['network', 'station', 'location',
+                               'channel', 'quality', 'version',
+                               'starttime', 'endtime', 'samplerate',
+                               'filename', 'byteoffset', 'bytes',
+                               'hash', 'timeindex', 'timespans',
+                               'timerates', 'format', 'filemodtime',
+                               'updated', 'scanned', 'requeststart',
+                               'requestend', 'requestid'])
+        # The same request set is issued in chunks to stay below SQLite's
+        # compound SELECT term limit.  Each chunk is one indexed query instead
+        # of one query per request.
+        for start in range(0, len(query_rows), self._MAX_SQL_TERMS):
+            chunk_rows = query_rows[start:start + self._MAX_SQL_TERMS]
+            requests_cte = self._build_request_cte(
+                session, chunk_rows, "raw_request_cte")
+
+            try:
+                if wildcards and summary_present:
+                    # Resolve wildcards using the summary table to:
+                    # a) resolve wildcards, allows use of '=' operator
+                    #    and table index
+                    # b) reduce index table search to channels that are
+                    #    known included
+                    # The join carries the requestid along so every flattened
+                    # row keeps the identity of the request it derives from.
+                    flattened_request_cte = (
+                        session
+                        .query(requests_cte.c.requestid.label("requestid"),
+                               self.TSIndexSummaryTable.network,
+                               self.TSIndexSummaryTable.station,
+                               self.TSIndexSummaryTable.location,
+                               self.TSIndexSummaryTable.channel,
+                               requests_cte.c.starttime,
+                               requests_cte.c.endtime)
+                        .filter(self.TSIndexSummaryTable.network.op('GLOB')
+                                (requests_cte.c.network))
+                        .filter(self.TSIndexSummaryTable.station.op('GLOB')
+                                (requests_cte.c.station))
+                        .filter(self.TSIndexSummaryTable.location.op('GLOB')
+                                (requests_cte.c.location))
+                        .filter(self.TSIndexSummaryTable.channel.op('GLOB')
+                                (requests_cte.c.channel))
+                        .filter(self.TSIndexSummaryTable.earliest <=
+                                requests_cte.c.endtime)
+                        .filter(self.TSIndexSummaryTable.latest >=
+                                requests_cte.c.starttime)
+                        .cte(name="flattened_request_cte"))
+                    result = (
+                        session
+                        .query(self.TSIndexTable,
+                               flattened_request_cte.c.requestid,
+                               flattened_request_cte.c.starttime,
+                               flattened_request_cte.c.endtime)
+                        .filter(self.TSIndexTable.network ==
+                                flattened_request_cte.c.network)
+                        .filter(self.TSIndexTable.station ==
+                                flattened_request_cte.c.station)
+                        .filter(self.TSIndexTable.location ==
+                                flattened_request_cte.c.location)
+                        .filter(self.TSIndexTable.channel ==
+                                flattened_request_cte.c.channel)
+                        .filter(self.TSIndexTable.starttime <=
+                                flattened_request_cte.c.endtime)
+                        .filter(self.TSIndexTable.endtime >=
+                                flattened_request_cte.c.starttime)
+                        .order_by(self.TSIndexTable.network,
+                                  self.TSIndexTable.station,
+                                  self.TSIndexTable.location,
+                                  self.TSIndexTable.channel,
+                                  self.TSIndexTable.starttime,
+                                  self.TSIndexTable.endtime))
+                else:
+                    # GLOB also matches an exact pattern, so the request CTE
+                    # can be joined directly without a summary table.  The
+                    # requestid correlation guarantees that an index row is
+                    # only paired with the request window it matched and keeps
+                    # identical requests from being deduplicated.
+                    result = (
+                        session
+                        .query(self.TSIndexTable,
+                               requests_cte.c.requestid,
+                               requests_cte.c.starttime,
+                               requests_cte.c.endtime)
+                        .filter(self.TSIndexTable.network.op('GLOB')
+                                (requests_cte.c.network))
+                        .filter(self.TSIndexTable.station.op('GLOB')
+                                (requests_cte.c.station))
+                        .filter(self.TSIndexTable.location.op('GLOB')
+                                (requests_cte.c.location))
+                        .filter(self.TSIndexTable.channel.op('GLOB')
+                                (requests_cte.c.channel))
+                        .filter(self.TSIndexTable.starttime <=
+                                requests_cte.c.endtime)
+                        .filter(self.TSIndexTable.endtime >=
+                                requests_cte.c.starttime)
+                        .order_by(self.TSIndexTable.network,
+                                  self.TSIndexTable.station,
+                                  self.TSIndexTable.location,
+                                  self.TSIndexTable.channel,
+                                  self.TSIndexTable.starttime,
+                                  self.TSIndexTable.endtime))
+            except Exception as err:
+                raise ValueError(str(err))
+
+            try:
+                for rt in result:
+                    row, requestid, requeststart, requestend = rt
+                    nrow = NamedRow(
+                            row.network, row.station, row.location,
+                            row.channel, row.quality, row.version,
+                            row.starttime, row.endtime, row.samplerate,
+                            row.filename, row.byteoffset, row.bytes,
+                            row.hash, row.timeindex, row.timespans,
+                            row.timerates, row.format, row.filemodtime,
+                            row.updated, row.scanned,
+                            requeststart, requestend, requestid
+                           )
+                    index_rows.append(nrow)
+            except ResourceClosedError:
+                pass  # query returned no results
         logger.debug("Fetched %d index rows" % len(index_rows))
         return index_rows
 
@@ -1721,72 +1753,58 @@ class TSIndexDatabaseHandler(object):
         session = self.session()
         query_rows = self._clean_query_rows(query_rows)
         tsindex_summary_cte = self.get_tsindex_summary_cte()
-        # Create a CTE that contains the request
-        try:
-            request_cte_name = "request_cte"
-            stmts = [
-                sa.select([
-                    sa.literal(a).label("network"),
-                    sa.literal(b).label("station"),
-                    sa.literal(c).label("location"),
-                    sa.literal(d).label("channel"),
-                    sa.literal(e).label("starttime")
-                    if e != '*' else
-                    sa.literal('0000-00-00T00:00:00').label("starttime"),
-                    sa.literal(f).label("endtime")
-                    if f != '*' else
-                    sa.literal('5000-00-00T00:00:00').label("endtime")
-                ])
-                for idx, (a, b, c, d, e, f) in enumerate(query_rows)
-            ]
-            requests = sa.union_all(*stmts)
-            requests_cte = requests.cte(name=request_cte_name)
-        except Exception as err:
-            raise ValueError(str(err))
-
-        # Select summary rows by joining with summary table
-        try:
-            # expand
-            result = (
-                session
-                .query(tsindex_summary_cte.c.network,
-                       tsindex_summary_cte.c.station,
-                       tsindex_summary_cte.c.location,
-                       tsindex_summary_cte.c.channel,
-                       tsindex_summary_cte.c.earliest,
-                       tsindex_summary_cte.c.latest,
-                       tsindex_summary_cte.c.updt)
-                .filter(tsindex_summary_cte.c.network.op('GLOB')
-                        (requests_cte.c.network))
-                .filter(tsindex_summary_cte.c.station.op('GLOB')
-                        (requests_cte.c.station))
-                .filter(tsindex_summary_cte.c.location.op('GLOB')
-                        (requests_cte.c.location))
-                .filter(tsindex_summary_cte.c.channel.op('GLOB')
-                        (requests_cte.c.channel))
-                .filter(tsindex_summary_cte.c.earliest <=
-                        requests_cte.c.endtime)
-                .filter(tsindex_summary_cte.c.latest >=
-                        requests_cte.c.starttime)
-                .order_by(tsindex_summary_cte.c.network,
-                          tsindex_summary_cte.c.station,
-                          tsindex_summary_cte.c.location,
-                          tsindex_summary_cte.c.channel,
-                          tsindex_summary_cte.c.earliest,
-                          tsindex_summary_cte.c.latest))
-        except Exception as err:
-            raise ValueError(str(err))
 
         # Map raw tuples to named tuples for clear referencing
         NamedRow = namedtuple('NamedRow',
                               ['network', 'station', 'location', 'channel',
                                'earliest', 'latest', 'updated'])
         summary_rows = []
-        try:
-            for row in result:
-                summary_rows.append(NamedRow(*row))
-        except ResourceClosedError:
-            pass  # query returned no results
+        # Query the request set in chunks to stay below SQLite's compound
+        # SELECT term limit.  The requestid correlation prevents the join from
+        # returning each summary row once per request window.
+        for start in range(0, len(query_rows), self._MAX_SQL_TERMS):
+            chunk_rows = query_rows[start:start + self._MAX_SQL_TERMS]
+            requests_cte = self._build_request_cte(
+                session, chunk_rows, "request_cte")
+
+            # Select summary rows by joining with summary table
+            try:
+                # expand
+                result = (
+                    session
+                    .query(tsindex_summary_cte.c.network,
+                           tsindex_summary_cte.c.station,
+                           tsindex_summary_cte.c.location,
+                           tsindex_summary_cte.c.channel,
+                           tsindex_summary_cte.c.earliest,
+                           tsindex_summary_cte.c.latest,
+                           tsindex_summary_cte.c.updt)
+                    .filter(tsindex_summary_cte.c.network.op('GLOB')
+                            (requests_cte.c.network))
+                    .filter(tsindex_summary_cte.c.station.op('GLOB')
+                            (requests_cte.c.station))
+                    .filter(tsindex_summary_cte.c.location.op('GLOB')
+                            (requests_cte.c.location))
+                    .filter(tsindex_summary_cte.c.channel.op('GLOB')
+                            (requests_cte.c.channel))
+                    .filter(tsindex_summary_cte.c.earliest <=
+                            requests_cte.c.endtime)
+                    .filter(tsindex_summary_cte.c.latest >=
+                            requests_cte.c.starttime)
+                    .order_by(tsindex_summary_cte.c.network,
+                              tsindex_summary_cte.c.station,
+                              tsindex_summary_cte.c.location,
+                              tsindex_summary_cte.c.channel,
+                              tsindex_summary_cte.c.earliest,
+                              tsindex_summary_cte.c.latest))
+            except Exception as err:
+                raise ValueError(str(err))
+
+            try:
+                for row in result:
+                    summary_rows.append(NamedRow(*row))
+            except ResourceClosedError:
+                pass  # query returned no results
         logger.debug("Fetched %d summary rows" % len(summary_rows))
         return summary_rows
 
@@ -1852,12 +1870,13 @@ class TSIndexDatabaseHandler(object):
             flat_query_rows = [select_all_query]
         else:
             # perform some formatting on the query rows to ensure that they
-            # query the database properly.
-            for i, qr in enumerate(query_rows):
-                query_rows[i] = self._create_query_row(*qr)
+            # query the database properly.  The caller's list is never
+            # modified in place.
+            cleaned_query_rows = [self._create_query_row(*qr)
+                                  for qr in query_rows]
 
             # flatten query rows
-            for req in query_rows:
+            for req in cleaned_query_rows:
                 networks = (req[0].replace(" ", "").split(",")
                             if req[0] else "*")
                 stations = (req[1].replace(" ", "").split(",")
